@@ -30,7 +30,13 @@ func SyncMCPServers(profileDir string) error {
 	profilePath := filepath.Join(profileDir, ".claude.json")
 	profileData, err := os.ReadFile(profilePath)
 	if err != nil {
-		return nil // Profile .claude.json doesn't exist yet (first run)
+		// First run: the profile's .claude.json doesn't exist yet. Bootstrap a
+		// minimal file so MCP servers are injected on the first `cpm install`
+		// instead of being silently skipped until claude has been launched once.
+		profileData = []byte("{\n  \"mcpServers\": {}\n}\n")
+		if werr := os.WriteFile(profilePath, profileData, 0o644); werr != nil {
+			return werr
+		}
 	}
 
 	var profile map[string]any
