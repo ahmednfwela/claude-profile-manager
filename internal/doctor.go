@@ -91,7 +91,7 @@ func RunDoctor(cfg *Config, profilesBase string) []Check {
 		}
 
 		// Check wrapper script
-		scriptPath := filepath.Join(cfg.BinDir, "claude-"+name)
+		scriptPath := filepath.Join(cfg.BinDir, LauncherFileName(name))
 		if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
 			checks = append(checks, Check{fmt.Sprintf("profile/%s/wrapper", name), "warn", "wrapper script missing (run cpm install)"})
 		} else {

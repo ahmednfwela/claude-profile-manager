@@ -85,10 +85,15 @@ func installCmd() *cobra.Command {
 			activeNames := make(map[string]bool)
 			names := sortedKeys(cfg.Profiles)
 
+			cpmPath, err := os.Executable()
+			if err != nil {
+				cpmPath = "cpm" // fall back to PATH resolution
+			}
+
 			for _, name := range names {
 				profile := cfg.Profiles[name]
 				profileDir := filepath.Join(profilesBase, name)
-				scriptName := "claude-" + name
+				scriptName := internal.LauncherFileName(name)
 
 				activeNames[scriptName] = true
 
@@ -106,7 +111,7 @@ func installCmd() *cobra.Command {
 					return fmt.Errorf("profile %s mcp sync: %w", name, err)
 				}
 
-				wrapper := internal.GenerateWrapper(name, profileDir, profile)
+				wrapper := internal.GenerateLauncher(name, profileDir, profile, cpmPath)
 				scriptPath := filepath.Join(cfg.BinDir, scriptName)
 				if err := internal.InstallWrapper(scriptPath, wrapper); err != nil {
 					return fmt.Errorf("profile %s wrapper: %w", name, err)
