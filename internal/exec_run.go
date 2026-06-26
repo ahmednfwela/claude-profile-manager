@@ -1,0 +1,78 @@
+package internal
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"sort"
+	"strings"
+)
+
+// runBypass lists the claude subcommands that must be passed straight through
+// without the profile's --add-dir/--model decoration. Kept in sync with the
+// historical bash-wrapper "subcommands" list.
+var runBypass = map[string]bool{
+	"mcp": true, "auth": true, "doctor": true, "install": true,
+	"setup-token": true, "update": true, "upgrade": true, "agents": true,
+	"auto-mode": true, "plugin": true, "plugins": true,
+}
+
+// BuildRunInvocation assembles everything needed to launch claude for a profile:
+// the resolved claude binary path, the full argv (argv[0] is the binary path),
+// and the environment. It centralizes the env filtering, ${VAR} expansion, and
+// subcommand bypass so both `cpm run` and the generated launchers share one
+// robust code path instead of a brittle shell script.
+func BuildRunInvocation(name, profileDir string, p *Profile, claudeArgs []string) (string, []string, []string, error) {
+	env := os.Environ()
+	// Drop inherited CLAUDE_*/ANTHROPIC_* vars so the profile starts clean.
+	filtered := env[:0]
+	for _, e := range env {
+		if !strings.HasPrefix(e, "CLAUDE_") && !strings.HasPrefix(e, "ANTHROPIC_") {
+			filtered = append(filtered, e)
+		}
+	}
+	filtered = append(filtered,
+		"CLAUDE_CONFIG_DIR="+profileDir,
+		"CLAUDE_PROFILE="+name,
+	)
+	for _, k := range sortedEnvKeys(p.Env) {
+		// os.ExpandEnv lets a config value reference another env var, e.g.
+		// ANTHROPIC_AUTH_TOKEN = "${GLM_AUTH_TOKEN}" — keeps secrets out of files.
+		filtered = append(filtered, k+"="+os.ExpandEnv(p.Env[k]))
+	}
+
+	claudePath, err := exec.LookPath("claude") // resolves claude.exe via PATHEXT on Windows
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("claude not found on PATH")
+	}
+
+	argv := []string{claudePath}
+	if len(claudeArgs) > 0 && runBypass[claudeArgs[0]] {
+		return claudePath, append(argv, claudeArgs...), filtered, nil
+	}
+	for _, d := range p.AddDirs {
+		argv = append(argv, "--add-dir", ExpandPath(d))
+	}
+	if p.Model != "" && !hasModelFlag(claudeArgs) {
+		argv = append(argv, "--model", p.Model)
+	}
+	return claudePath, append(argv, claudeArgs...), filtered, nil
+}
+
+func hasModelFlag(args []string) bool {
+	for _, a := range args {
+		if a == "--model" || strings.HasPrefix(a, "--model=") {
+			return true
+		}
+	}
+	return false
+}
+
+func sortedEnvKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}

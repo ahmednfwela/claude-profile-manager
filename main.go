@@ -3,11 +3,9 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 
 	"github.com/jakubkontra/cpm/internal"
 	"github.com/spf13/cobra"
@@ -376,49 +374,12 @@ func runCmd() *cobra.Command {
 			profilesBase := internal.ProfilesBaseDir(configPath)
 			profileDir := filepath.Join(profilesBase, name)
 
-			// Build environment
-			env := os.Environ()
-			// Remove existing CLAUDE_*/ANTHROPIC_* vars
-			filtered := env[:0]
-			for _, e := range env {
-				if !strings.HasPrefix(e, "CLAUDE_") && !strings.HasPrefix(e, "ANTHROPIC_") {
-					filtered = append(filtered, e)
-				}
-			}
-			filtered = append(filtered,
-				fmt.Sprintf("CLAUDE_CONFIG_DIR=%s", profileDir),
-				fmt.Sprintf("CLAUDE_PROFILE=%s", name),
-			)
-			for k, v := range profile.Env {
-				filtered = append(filtered, fmt.Sprintf("%s=%s", k, v))
-			}
-
-			// Build claude command with add-dirs and model
-			fullArgs := []string{"claude"}
-			for _, d := range profile.AddDirs {
-				fullArgs = append(fullArgs, "--add-dir", internal.ExpandPath(d))
-			}
-			if profile.Model != "" {
-				// Check if user passed --model
-				hasModel := false
-				for _, a := range claudeArgs {
-					if a == "--model" || strings.HasPrefix(a, "--model=") {
-						hasModel = true
-						break
-					}
-				}
-				if !hasModel {
-					fullArgs = append(fullArgs, "--model", profile.Model)
-				}
-			}
-			fullArgs = append(fullArgs, claudeArgs...)
-
-			claudePath, err := exec.LookPath("claude")
+			claudePath, argv, env, err := internal.BuildRunInvocation(name, profileDir, profile, claudeArgs)
 			if err != nil {
-				return fmt.Errorf("claude not found on PATH")
+				return err
 			}
 
-			return syscall.Exec(claudePath, fullArgs, filtered)
+			return internal.RunClaude(claudePath, argv, env)
 		},
 	}
 }
