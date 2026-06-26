@@ -56,25 +56,22 @@ func SetupProfile(name string, profileDir, sourceDir string, forceSync bool) err
 			continue
 		}
 
-		linkTarget, err := os.Readlink(dst)
-		if err == nil {
-			// Existing symlink — check if target matches
-			absSrc, _ := filepath.Abs(src)
-			absLink, _ := filepath.Abs(linkTarget)
-			if absSrc == absLink {
+		if isLink(dst) {
+			// Existing link — keep it if it already points at src.
+			if linkPointsTo(dst, src) {
 				continue
 			}
 			os.Remove(dst)
-		} else if _, err := os.Stat(dst); err == nil {
+		} else if _, err := os.Lstat(dst); err == nil {
 			// Real directory exists, don't replace
 			fmt.Printf("  skipped %s/ (real directory exists)\n", dirname)
 			continue
 		}
 
-		if err := os.Symlink(src, dst); err != nil {
-			return fmt.Errorf("cannot symlink %s: %w", dirname, err)
+		if err := linkDir(src, dst); err != nil {
+			return fmt.Errorf("cannot link %s: %w", dirname, err)
 		}
-		fmt.Printf("  symlinked %s/ -> %s\n", dirname, src)
+		fmt.Printf("  linked %s/ -> %s\n", dirname, src)
 	}
 
 	return nil

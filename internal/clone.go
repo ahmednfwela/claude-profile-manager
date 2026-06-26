@@ -47,10 +47,10 @@ func CloneProfile(sourceName, targetName, profilesBase, sourceDir string, cfg *C
 			continue
 		}
 
-		if err := os.Symlink(target, link); err != nil {
-			return fmt.Errorf("cannot symlink %s: %w", dirname, err)
+		if err := linkDir(target, link); err != nil {
+			return fmt.Errorf("cannot link %s: %w", dirname, err)
 		}
-		fmt.Printf("  symlinked %s/ -> %s\n", dirname, target)
+		fmt.Printf("  linked %s/ -> %s\n", dirname, target)
 	}
 
 	fmt.Printf("\nProfile %q cloned from %q.\n", targetName, sourceName)

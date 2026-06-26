@@ -64,15 +64,15 @@ func RunDoctor(cfg *Config, profilesBase string) []Check {
 			continue
 		}
 
-		// Check symlinks
+		// Check links (symlinks on Unix, junctions on Windows)
 		for _, dir := range symlinkDirs {
 			link := filepath.Join(profileDir, dir)
-			target, err := os.Readlink(link)
-			if err != nil {
-				continue // Not a symlink or doesn't exist
+			if !isLink(link) {
+				continue // not a link or doesn't exist
 			}
-			if _, err := os.Stat(target); os.IsNotExist(err) {
-				checks = append(checks, Check{fmt.Sprintf("profile/%s/%s", name, dir), "error", fmt.Sprintf("broken symlink -> %s", target)})
+			// os.Stat follows the link/junction; an error means a dangling target.
+			if _, err := os.Stat(link); err != nil {
+				checks = append(checks, Check{fmt.Sprintf("profile/%s/%s", name, dir), "error", "broken link (target missing)"})
 			}
 		}
 
