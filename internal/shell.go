@@ -4,25 +4,85 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
-// GenerateUseOutput outputs shell commands to be eval'd by the user's shell.
-// Usage: eval "$(cpm use <profile>)"
-func GenerateUseOutput(name string, profileDir string, profile *Profile) string {
+// Shell identifies a target shell for the emitted `use`/`hook`/`direnv` output.
+type Shell string
+
+const (
+	ShellBash       Shell = "bash"
+	ShellZsh        Shell = "zsh"
+	ShellPowerShell Shell = "powershell"
+)
+
+// DefaultShell is the shell assumed when --shell is not given: PowerShell on
+// Windows, a POSIX shell elsewhere.
+func DefaultShell() Shell {
+	if runtime.GOOS == "windows" {
+		return ShellPowerShell
+	}
+	return ShellBash
+}
+
+// ParseShell maps a --shell flag value to a Shell, defaulting by OS for "" / "auto".
+func ParseShell(s string) (Shell, error) {
+	switch strings.ToLower(s) {
+	case "", "auto":
+		return DefaultShell(), nil
+	case "bash":
+		return ShellBash, nil
+	case "zsh":
+		return ShellZsh, nil
+	case "powershell", "pwsh":
+		return ShellPowerShell, nil
+	default:
+		return "", fmt.Errorf("unsupported shell %q (use bash, zsh, or powershell)", s)
+	}
+}
+
+// GenerateUseOutput outputs shell commands to switch the current shell to a
+// profile. POSIX: eval "$(cpm use <profile>)". PowerShell: cpm use <profile> | Invoke-Expression.
+func GenerateUseOutput(name string, profileDir string, profile *Profile, shell Shell) string {
+	if shell == ShellPowerShell {
+		return useOutputPowerShell(name, profileDir, profile)
+	}
+	return useOutputPosix(name, profileDir, profile)
+}
+
+func useOutputPosix(name, profileDir string, profile *Profile) string {
 	var b strings.Builder
 
 	// Unset CLAUDE_*/ANTHROPIC_* vars
 	b.WriteString("unset $(env | grep -E '^(CLAUDE_|ANTHROPIC_)' | cut -d= -f1) 2>/dev/null;\n")
 
-	b.WriteString(fmt.Sprintf("export CLAUDE_CONFIG_DIR=\"%s\";\n", profileDir))
-	b.WriteString(fmt.Sprintf("export CLAUDE_PROFILE=\"%s\";\n", name))
+	fmt.Fprintf(&b, "export CLAUDE_CONFIG_DIR=\"%s\";\n", profileDir)
+	fmt.Fprintf(&b, "export CLAUDE_PROFILE=\"%s\";\n", name)
 
-	for k, v := range profile.Env {
-		b.WriteString(fmt.Sprintf("export %s=\"%s\";\n", k, v))
+	for _, k := range sortedEnvKeys(profile.Env) {
+		fmt.Fprintf(&b, "export %s=\"%s\";\n", k, os.ExpandEnv(profile.Env[k]))
 	}
 
-	b.WriteString(fmt.Sprintf("echo \"Switched to profile: %s\";\n", name))
+	fmt.Fprintf(&b, "echo \"Switched to profile: %s\";\n", name)
+
+	return b.String()
+}
+
+func useOutputPowerShell(name, profileDir string, profile *Profile) string {
+	var b strings.Builder
+
+	// Remove inherited CLAUDE_*/ANTHROPIC_* vars.
+	b.WriteString("Get-ChildItem Env: | Where-Object Name -match '^(CLAUDE_|ANTHROPIC_)' | ForEach-Object { Remove-Item \"Env:$($_.Name)\" };\n")
+
+	fmt.Fprintf(&b, "$env:CLAUDE_CONFIG_DIR='%s';\n", profileDir)
+	fmt.Fprintf(&b, "$env:CLAUDE_PROFILE='%s';\n", name)
+
+	for _, k := range sortedEnvKeys(profile.Env) {
+		fmt.Fprintf(&b, "$env:%s='%s';\n", k, os.ExpandEnv(profile.Env[k]))
+	}
+
+	fmt.Fprintf(&b, "Write-Host 'Switched to profile: %s';\n", name)
 
 	return b.String()
 }
@@ -63,9 +123,15 @@ func DetectProfileFile(startDir string) (string, error) {
 	return "", fmt.Errorf("no .claude-profile file found")
 }
 
-// GenerateShellHook generates a shell hook function for auto-switching.
-// Add to .zshrc/.bashrc: eval "$(cpm hook)"
-func GenerateShellHook() string {
+// GenerateShellHook generates a shell hook function for auto-switching on cd.
+func GenerateShellHook(shell Shell) string {
+	if shell == ShellPowerShell {
+		return shellHookPowerShell()
+	}
+	return shellHookPosix()
+}
+
+func shellHookPosix() string {
 	return `# cpm auto-switch hook — add to your .zshrc or .bashrc:
 #   eval "$(cpm hook)"
 _cpm_auto_switch() {
@@ -99,6 +165,32 @@ else
   alias cd='_cpm_original_cd'
 fi
 _cpm_auto_switch
+`
+}
+
+// shellHookPowerShell wraps the prompt function (PowerShell has no chpwd) so the
+// active profile auto-switches based on the nearest .claude-profile file.
+// Add to $PROFILE:  cpm hook --shell powershell | Out-String | Invoke-Expression
+func shellHookPowerShell() string {
+	return `# cpm auto-switch hook — add to your $PROFILE:
+#   cpm hook --shell powershell | Out-String | Invoke-Expression
+function global:_cpm_auto_switch {
+  $d = (Get-Location).Path; $f = $null
+  while ($d) {
+    $c = Join-Path $d '.claude-profile'
+    if (Test-Path $c) { $f = $c; break }
+    $p = Split-Path $d -Parent; if ($p -eq $d) { break }; $d = $p
+  }
+  if ($f) {
+    $t = (Get-Content $f -Raw).Trim()
+    if ($t -and $t -ne $env:CLAUDE_PROFILE) { cpm use $t --shell powershell | Invoke-Expression; Write-Host "[cpm] using profile: $t" }
+  } elseif ($env:CLAUDE_PROFILE) {
+    Get-ChildItem Env: | Where-Object Name -match '^(CLAUDE_|ANTHROPIC_)' | ForEach-Object { Remove-Item "Env:$($_.Name)" }
+    Write-Host "[cpm] profile unset"
+  }
+}
+if (-not $global:__cpm_prompt_saved) { $global:__cpm_prompt_saved = $function:prompt }
+function global:prompt { _cpm_auto_switch; if ($global:__cpm_prompt_saved) { & $global:__cpm_prompt_saved } else { "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " } }
 `
 }
 

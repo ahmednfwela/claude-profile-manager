@@ -15,12 +15,12 @@ func TestGenerateUseOutput(t *testing.T) {
 		},
 	}
 
-	out := GenerateUseOutput("test", "/profiles/test", profile)
+	out := GenerateUseOutput("test", "/profiles/test", profile, ShellBash)
 
 	mustContain := []string{
-		`CLAUDE_CONFIG_DIR="/profiles/test"`,
-		`CLAUDE_PROFILE="test"`,
-		`CUSTOM_VAR="value"`,
+		`export CLAUDE_CONFIG_DIR="/profiles/test"`,
+		`export CLAUDE_PROFILE="test"`,
+		`export CUSTOM_VAR="value"`,
 		"Switched to profile: test",
 	}
 
@@ -28,6 +28,35 @@ func TestGenerateUseOutput(t *testing.T) {
 		if !strings.Contains(out, s) {
 			t.Errorf("use output missing %q", s)
 		}
+	}
+}
+
+func TestGenerateUseOutputPowerShell(t *testing.T) {
+	profile := &Profile{
+		Description: "Test",
+		Env: map[string]string{
+			"CUSTOM_VAR": "value",
+		},
+	}
+
+	out := GenerateUseOutput("test", `C:\profiles\test`, profile, ShellPowerShell)
+
+	mustContain := []string{
+		`$env:CLAUDE_CONFIG_DIR='C:\profiles\test'`,
+		`$env:CLAUDE_PROFILE='test'`,
+		`$env:CUSTOM_VAR='value'`,
+		"Switched to profile: test",
+		"Remove-Item", // clears inherited CLAUDE_/ANTHROPIC_ vars
+	}
+
+	for _, s := range mustContain {
+		if !strings.Contains(out, s) {
+			t.Errorf("powershell use output missing %q in:\n%s", s, out)
+		}
+	}
+	// PowerShell output must not use POSIX `export`.
+	if strings.Contains(out, "export ") {
+		t.Errorf("powershell use output should not contain POSIX export:\n%s", out)
 	}
 }
 
@@ -162,7 +191,7 @@ func TestUnlinkProfileNotFound(t *testing.T) {
 }
 
 func TestGenerateShellHook(t *testing.T) {
-	hook := GenerateShellHook()
+	hook := GenerateShellHook(ShellBash)
 
 	mustContain := []string{
 		"_cpm_auto_switch",
@@ -176,6 +205,28 @@ func TestGenerateShellHook(t *testing.T) {
 		if !strings.Contains(hook, s) {
 			t.Errorf("hook missing %q", s)
 		}
+	}
+}
+
+func TestGenerateShellHookPowerShell(t *testing.T) {
+	hook := GenerateShellHook(ShellPowerShell)
+
+	mustContain := []string{
+		"_cpm_auto_switch",
+		".claude-profile",
+		"cpm use",
+		"function global:prompt", // PowerShell has no chpwd; wrap the prompt
+		"Invoke-Expression",
+	}
+
+	for _, s := range mustContain {
+		if !strings.Contains(hook, s) {
+			t.Errorf("powershell hook missing %q", s)
+		}
+	}
+	// Must not emit the POSIX zsh hook machinery.
+	if strings.Contains(hook, "chpwd") || strings.Contains(hook, "ZSH_VERSION") {
+		t.Errorf("powershell hook should not contain zsh machinery:\n%s", hook)
 	}
 }
 

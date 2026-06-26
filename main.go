@@ -208,11 +208,17 @@ func statusCmd() *cobra.Command {
 }
 
 func direnvCmd() *cobra.Command {
-	return &cobra.Command{
+	var shellFlag string
+	cmd := &cobra.Command{
 		Use:   "direnv <profile>",
 		Short: "Print .envrc snippet for a profile",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			shell, err := internal.ParseShell(shellFlag)
+			if err != nil {
+				return err
+			}
+
 			cfg, err := internal.LoadConfig(configPath)
 			if err != nil {
 				return err
@@ -227,20 +233,29 @@ func direnvCmd() *cobra.Command {
 			profilesBase := internal.ProfilesBaseDir(configPath)
 			profileDir := filepath.Join(profilesBase, name)
 
-			fmt.Print(internal.GenerateDirenvSnippet(name, profileDir))
+			fmt.Print(internal.GenerateDirenvSnippet(name, profileDir, shell))
 			return nil
 		},
 	}
+
+	cmd.Flags().StringVar(&shellFlag, "shell", "", "target shell: bash, zsh, or powershell (default: auto by OS)")
+	return cmd
 }
 
 func useCmd() *cobra.Command {
-	return &cobra.Command{
+	var shellFlag string
+	cmd := &cobra.Command{
 		Use:   "use <profile>",
 		Short: "Switch the current shell to a profile (use with eval)",
-		Long:  "Switch the current shell to a profile.\nUsage: eval \"$(cpm use <profile>)\"",
+		Long:  "Switch the current shell to a profile.\nPOSIX:      eval \"$(cpm use <profile>)\"\nPowerShell: cpm use <profile> | Invoke-Expression",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
+
+			shell, err := internal.ParseShell(shellFlag)
+			if err != nil {
+				return err
+			}
 
 			cfg, err := internal.LoadConfig(configPath)
 			if err != nil {
@@ -269,10 +284,13 @@ func useCmd() *cobra.Command {
 			profilesBase := internal.ProfilesBaseDir(configPath)
 			profileDir := filepath.Join(profilesBase, name)
 
-			fmt.Print(internal.GenerateUseOutput(name, profileDir, profile))
+			fmt.Print(internal.GenerateUseOutput(name, profileDir, profile, shell))
 			return nil
 		},
 	}
+
+	cmd.Flags().StringVar(&shellFlag, "shell", "", "target shell: bash, zsh, or powershell (default: auto by OS)")
+	return cmd
 }
 
 func whichCmd() *cobra.Command {
@@ -461,14 +479,23 @@ func credentialsCmd() *cobra.Command {
 }
 
 func hookCmd() *cobra.Command {
-	return &cobra.Command{
+	var shellFlag string
+	cmd := &cobra.Command{
 		Use:   "hook",
 		Short: "Print shell hook for auto-switching via .claude-profile files",
-		Long:  "Print shell hook for auto-switching.\nAdd to your .zshrc: eval \"$(cpm hook)\"",
-		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Print(internal.GenerateShellHook())
+		Long:  "Print shell hook for auto-switching.\nPOSIX:      add to your .zshrc/.bashrc: eval \"$(cpm hook)\"\nPowerShell: add to your $PROFILE:        cpm hook --shell powershell | Out-String | Invoke-Expression",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			shell, err := internal.ParseShell(shellFlag)
+			if err != nil {
+				return err
+			}
+			fmt.Print(internal.GenerateShellHook(shell))
+			return nil
 		},
 	}
+
+	cmd.Flags().StringVar(&shellFlag, "shell", "", "target shell: bash, zsh, or powershell (default: auto by OS)")
+	return cmd
 }
 
 func linkCmd() *cobra.Command {
