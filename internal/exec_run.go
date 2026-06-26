@@ -56,6 +56,10 @@ func BuildRunInvocation(name, profileDir string, p *Profile, claudeArgs []string
 	if p.Model != "" && !hasModelFlag(claudeArgs) {
 		argv = append(argv, "--model", p.Model)
 	}
+	// Profile-level extra flags (e.g. --dangerously-skip-permissions). Injected
+	// only on real claude launches — the bypass path above returns before here,
+	// so management subcommands (mcp/auth/doctor/...) never receive them.
+	argv = append(argv, p.Args...)
 	return claudePath, append(argv, claudeArgs...), filtered, nil
 }
 

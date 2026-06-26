@@ -17,6 +17,7 @@ type Profile struct {
 	Description string            `toml:"description"`
 	Model       string            `toml:"model"`
 	AddDirs     []string          `toml:"add_dirs"`
+	Args        []string          `toml:"args"`
 	Env         map[string]string `toml:"env"`
 	Attribution *Attribution      `toml:"attribution"`
 }
