@@ -20,6 +20,14 @@ var (
 const repoOwner = "jakubkontra"
 const repoName = "claude-profile-manager"
 
+// binaryName is the on-disk cpm binary name for the current OS.
+func binaryName() string {
+	if runtime.GOOS == "windows" {
+		return "cpm.exe"
+	}
+	return "cpm"
+}
+
 type githubRelease struct {
 	TagName string        `json:"tag_name"`
 	Assets  []githubAsset `json:"assets"`
@@ -76,6 +84,9 @@ func Upgrade(binDir string) error {
 
 	// Find matching asset
 	assetName := fmt.Sprintf("cpm_%s_%s", runtime.GOOS, runtime.GOARCH)
+	if runtime.GOOS == "windows" {
+		assetName += ".exe"
+	}
 	var downloadURL string
 	for _, asset := range release.Assets {
 		if strings.Contains(asset.Name, assetName) && !strings.HasSuffix(asset.Name, ".sha256") {
@@ -120,8 +131,13 @@ func Upgrade(binDir string) error {
 		return fmt.Errorf("cannot set permissions: %w", err)
 	}
 
-	// Replace current binary
-	targetPath := filepath.Join(binDir, "cpm")
+	// Replace current binary. Windows locks the running image, so move the
+	// running exe aside first (a running exe can be renamed but not overwritten).
+	targetPath := filepath.Join(binDir, binaryName())
+	if runtime.GOOS == "windows" {
+		_ = os.Remove(targetPath + ".old")
+		_ = os.Rename(targetPath, targetPath+".old")
+	}
 	if err := os.Rename(tmpPath, targetPath); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("cannot replace binary: %w", err)
