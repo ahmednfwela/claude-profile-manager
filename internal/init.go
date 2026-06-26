@@ -37,7 +37,7 @@ func RunInit(configPath string) error {
 	binDir, _ := reader.ReadString('\n')
 	binDir = strings.TrimSpace(binDir)
 	if binDir == "" {
-		binDir = "~/.local/bin"
+		binDir = defaultBinDir()
 	}
 
 	// Profiles

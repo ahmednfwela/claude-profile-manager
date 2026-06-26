@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"time"
 )
 
@@ -52,7 +53,14 @@ func RunDoctor(cfg *Config, profilesBase string) []Check {
 	if binOnPath {
 		checks = append(checks, Check{"bin dir on PATH", "ok", cfg.BinDir})
 	} else {
-		checks = append(checks, Check{"bin dir on PATH", "warn", fmt.Sprintf("%s is not on PATH", cfg.BinDir)})
+		detail := fmt.Sprintf("%s is not on PATH", cfg.BinDir)
+		if runtime.GOOS == "windows" {
+			// Guide the user; never mutate PATH automatically. setx truncates
+			// PATH at 1024 chars, so recommend the .NET Environment API instead.
+			detail += fmt.Sprintf(" — add it (user scope, no elevation): "+
+				"[Environment]::SetEnvironmentVariable('Path', \"$env:Path;%s\", 'User')", cfg.BinDir)
+		}
+		checks = append(checks, Check{"bin dir on PATH", "warn", detail})
 	}
 
 	// Check each profile

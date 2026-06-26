@@ -39,6 +39,14 @@ func DefaultConfigPath() string {
 	return filepath.Join(home, ".claude-profiles", "config.toml")
 }
 
+// defaultBinDir is the default install location for the generated launchers.
+// ~/.local/bin is already on PATH on the target machines (Unix, and the Windows
+// host this port targets), so it is kept as the single cross-platform default.
+// If it is not on PATH, `cpm doctor` warns (it never mutates PATH automatically).
+func defaultBinDir() string {
+	return "~/.local/bin"
+}
+
 func LoadConfig(path string) (*Config, error) {
 	path = ExpandPath(path)
 
@@ -56,7 +64,7 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.SourceDir = "~/.claude"
 	}
 	if cfg.BinDir == "" {
-		cfg.BinDir = "~/.local/bin"
+		cfg.BinDir = defaultBinDir()
 	}
 	cfg.SourceDir = ExpandPath(cfg.SourceDir)
 	cfg.BinDir = ExpandPath(cfg.BinDir)
@@ -88,7 +96,7 @@ func LoadCloudConfig(path string) (*Config, error) {
 		// Return a default config if no config file exists
 		return &Config{
 			SourceDir: ExpandPath("~/.claude"),
-			BinDir:    ExpandPath("~/.local/bin"),
+			BinDir:    ExpandPath(defaultBinDir()),
 		}, nil
 	}
 
@@ -101,7 +109,7 @@ func LoadCloudConfig(path string) (*Config, error) {
 		cfg.SourceDir = "~/.claude"
 	}
 	if cfg.BinDir == "" {
-		cfg.BinDir = "~/.local/bin"
+		cfg.BinDir = defaultBinDir()
 	}
 	cfg.SourceDir = ExpandPath(cfg.SourceDir)
 	cfg.BinDir = ExpandPath(cfg.BinDir)
