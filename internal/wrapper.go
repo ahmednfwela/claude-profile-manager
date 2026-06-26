@@ -37,6 +37,13 @@ func CleanupStaleScripts(binDir string, activeNames map[string]bool) {
 		if entry.IsDir() {
 			continue
 		}
+		// Only ever consider our own launcher files (claude-<name>[.cmd]). Never
+		// read or delete unrelated files — notably the cpm binary itself, which
+		// embeds the marker string as a compiled constant and would otherwise be
+		// matched and (on Unix, where a running binary can be unlinked) deleted.
+		if !strings.HasPrefix(entry.Name(), "claude-") {
+			continue
+		}
 		if activeNames[entry.Name()] {
 			continue
 		}

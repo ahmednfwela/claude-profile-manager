@@ -68,6 +68,13 @@ func TestCleanupStaleScripts(t *testing.T) {
 	other := filepath.Join(dir, "other-script")
 	os.WriteFile(other, []byte("#!/bin/bash\necho other\n"), 0o755)
 
+	// A non-launcher file that DOES embed the marker — e.g. the cpm binary,
+	// which carries the marker as a compiled string constant. It must never be
+	// matched/removed (regression: it was being deleted because the name guard
+	// was missing and the marker substring matched the binary).
+	binary := filepath.Join(dir, "cpm.exe")
+	os.WriteFile(binary, []byte("MZ\x00\x00"+marker+"\x00compiled\n"), 0o755)
+
 	activeNames := map[string]bool{"claude-keep": true}
 	CleanupStaleScripts(dir, activeNames)
 
@@ -79,5 +86,8 @@ func TestCleanupStaleScripts(t *testing.T) {
 	}
 	if _, err := os.Stat(other); err != nil {
 		t.Error("non-cpm script should be kept")
+	}
+	if _, err := os.Stat(binary); err != nil {
+		t.Error("a marker-bearing non-launcher (cpm binary) must NOT be removed")
 	}
 }
