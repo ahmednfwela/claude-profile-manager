@@ -408,7 +408,9 @@ func GatherSyncFiles(cfg *Config, configPath string) (map[string]string, error) 
 				return nil
 			}
 			rel, _ := filepath.Rel(cfg.SourceDir, path)
-			files[rel] = path
+			// Normalize to forward slashes so the cloud repo path is canonical
+			// across OSes (a repo synced from Windows stays usable on Unix).
+			files[filepath.ToSlash(rel)] = path
 			return nil
 		})
 	}

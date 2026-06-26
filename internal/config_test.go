@@ -191,8 +191,12 @@ description = "Test"
 }
 
 func TestProfilesBaseDir(t *testing.T) {
-	got := ProfilesBaseDir("/home/user/.claude-profiles/config.toml")
-	if got != "/home/user/.claude-profiles" {
-		t.Errorf("ProfilesBaseDir = %q, want /home/user/.claude-profiles", got)
+	// ProfilesBaseDir returns native-separator paths; build the expectation the
+	// same way so the assertion holds on Windows (\) and Unix (/) alike.
+	in := filepath.FromSlash("/home/user/.claude-profiles/config.toml")
+	want := filepath.FromSlash("/home/user/.claude-profiles")
+	got := ProfilesBaseDir(in)
+	if got != want {
+		t.Errorf("ProfilesBaseDir = %q, want %q", got, want)
 	}
 }

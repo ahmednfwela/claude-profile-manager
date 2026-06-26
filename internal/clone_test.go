@@ -47,16 +47,13 @@ func TestCloneProfile(t *testing.T) {
 		t.Errorf("cloned settings.json = %q", string(data))
 	}
 
-	// Check symlinks point to source dir (not the original profile)
+	// Check links point to source dir (not the original profile).
+	// linkPointsTo works for both POSIX symlinks and Windows junctions.
 	for _, dir := range []string{"skills", "plugins"} {
-		target, err := os.Readlink(filepath.Join(clonedDir, dir))
-		if err != nil {
-			t.Errorf("%s should be a symlink", dir)
-			continue
-		}
+		link := filepath.Join(clonedDir, dir)
 		expected := filepath.Join(sourceDir, dir)
-		if target != expected {
-			t.Errorf("%s symlink = %q, want %q", dir, target, expected)
+		if !linkPointsTo(link, expected) {
+			t.Errorf("%s should link to %s", dir, expected)
 		}
 	}
 }

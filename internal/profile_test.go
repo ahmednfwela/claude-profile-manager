@@ -105,14 +105,10 @@ func TestSetupProfileCreatesSymlinks(t *testing.T) {
 
 	for _, dir := range []string{"commands", "skills", "plugins"} {
 		link := filepath.Join(profileDir, dir)
-		target, err := os.Readlink(link)
-		if err != nil {
-			t.Errorf("%s should be a symlink: %v", dir, err)
-			continue
-		}
 		expected := filepath.Join(sourceDir, dir)
-		if target != expected {
-			t.Errorf("%s symlink target = %q, want %q", dir, target, expected)
+		// linkPointsTo works for both POSIX symlinks and Windows junctions.
+		if !linkPointsTo(link, expected) {
+			t.Errorf("%s should link to %s", dir, expected)
 		}
 	}
 }
@@ -130,10 +126,9 @@ func TestSetupProfileSkipsSymlinkForRealDir(t *testing.T) {
 
 	SetupProfile("test", profileDir, sourceDir, false)
 
-	// Should still be a real directory, not a symlink
-	_, err := os.Readlink(filepath.Join(profileDir, "commands"))
-	if err == nil {
-		t.Error("commands should remain a real directory, not be replaced by symlink")
+	// Should still be a real directory, not a link
+	if isLink(filepath.Join(profileDir, "commands")) {
+		t.Error("commands should remain a real directory, not be replaced by a link")
 	}
 
 	// Custom file should still exist
