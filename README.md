@@ -168,6 +168,7 @@ The `.claude-profile` file is automatically added to `.gitignore`.
 | `cpm credentials` | Show OAuth token status for all profiles |
 | `cpm use <profile>` | Switch shell: `eval "$(cpm use work)"` |
 | `cpm run <profile> [args]` | One-shot: `cpm run work -p "explain this"` |
+| `cpm handoff <session-id> <from> <to>` | Move a background session to another profile's account |
 | `cpm link <profile>` | Create `.claude-profile` in current dir |
 | `cpm unlink` | Remove `.claude-profile` |
 | `cpm hook` | Print shell hook for auto-switch |
@@ -181,6 +182,19 @@ The `.claude-profile` file is automatically added to `.gitignore`.
 | `cpm cloud pull [--dry-run]` | Pull settings from cloud |
 | `cpm cloud status` | Show cloud sync status |
 | `cpm cloud remote <url>` | Set/update git remote URL |
+
+## Session handoff and rate-limit recovery
+
+`cpm handoff <session-id> <from> <to>` stops a background session on one profile and re-dispatches its conversation on another via `claude --bg --resume` — useful when one account's usage limits are exhausted. Passing the same profile twice re-forks on the same account. Requires the profiles to share one projects store (junction/symlink `<profile>/projects` to a common directory).
+
+`scripts/claude-reset-nudger.ps1` (Windows) automates the same-account case: a scheduled task that watches each profile for rate-limit interruption flags and re-forks affected background sessions once. Copy it somewhere stable and run with `-Install`:
+
+```powershell
+Copy-Item scripts\claude-reset-nudger.ps1 $env:USERPROFILE\.local\bin\
+pwsh -File $env:USERPROFILE\.local\bin\claude-reset-nudger.ps1 -Install
+```
+
+Rails: background sessions only, flags older than 2h ignored, one nudge per flag, max 3 attempts per session per 24h. The flag format (`.bdaya-resume/latest.json`: `{error_type, sessionId, at}`) is written by an external hook on StopFailure.
 
 ## Cloud sync
 
