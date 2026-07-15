@@ -42,12 +42,16 @@ func TestBuildRunInvocationInjectsArgs(t *testing.T) {
 func TestBuildRunInvocationBypassSkipsArgs(t *testing.T) {
 	stubClaudeOnPath(t)
 	p := &Profile{Args: []string{"--dangerously-skip-permissions"}}
-	// A bypassed management subcommand must NOT receive the profile decoration.
-	_, argv, _, err := BuildRunInvocation("glm", t.TempDir(), p, []string{"mcp", "list"})
-	if err != nil {
-		t.Fatalf("BuildRunInvocation: %v", err)
-	}
-	if strings.Contains(strings.Join(argv, " "), "--dangerously-skip-permissions") {
-		t.Errorf("bypass subcommand should not get profile Args; got %v", argv)
+	// Every bypassed subcommand must NOT receive the profile decoration —
+	// claude treats flags-before-subcommand as a prompt, so decoration turns
+	// e.g. `stop <id>` into a billed model turn (observed live 2026-07-15).
+	for _, sub := range []string{"mcp", "stop", "attach", "logs", "respawn", "daemon"} {
+		_, argv, _, err := BuildRunInvocation("glm", t.TempDir(), p, []string{sub, "arg1"})
+		if err != nil {
+			t.Fatalf("BuildRunInvocation(%s): %v", sub, err)
+		}
+		if strings.Contains(strings.Join(argv, " "), "--dangerously-skip-permissions") {
+			t.Errorf("bypass subcommand %q should not get profile Args; got %v", sub, argv)
+		}
 	}
 }

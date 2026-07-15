@@ -11,10 +11,19 @@ import (
 // runBypass lists the claude subcommands that must be passed straight through
 // without the profile's --add-dir/--model decoration. Kept in sync with the
 // historical bash-wrapper "subcommands" list.
+//
+// This must cover EVERY claude subcommand, including the hidden daemon-session
+// ones (attach/logs/stop/respawn/daemon): claude's CLI does not parse flags
+// placed before a subcommand, so a decorated invocation like
+// `claude --dangerously-skip-permissions stop <id>` is treated as a PROMPT and
+// silently runs a model turn instead of the subcommand.
 var runBypass = map[string]bool{
 	"mcp": true, "auth": true, "doctor": true, "install": true,
 	"setup-token": true, "update": true, "upgrade": true, "agents": true,
 	"auto-mode": true, "plugin": true, "plugins": true,
+	"attach": true, "logs": true, "stop": true, "respawn": true,
+	"daemon": true, "gateway": true, "project": true,
+	"remote-control": true, "ultrareview": true,
 }
 
 // BuildRunInvocation assembles everything needed to launch claude for a profile:

@@ -41,6 +41,7 @@ func main() {
 	root.AddCommand(initCmd())
 	root.AddCommand(doctorCmd())
 	root.AddCommand(runCmd())
+	root.AddCommand(handoffCmd())
 	root.AddCommand(cloneCmd())
 	root.AddCommand(promptCmd())
 	root.AddCommand(credentialsCmd())
@@ -405,6 +406,53 @@ func runCmd() *cobra.Command {
 			return internal.RunClaude(claudePath, argv, env)
 		},
 	}
+}
+
+func handoffCmd() *cobra.Command {
+	var prompt, name string
+
+	cmd := &cobra.Command{
+		Use:   "handoff <session-id> <from-profile> <to-profile>",
+		Short: "Move a background session to another profile's account (stop, then --bg --resume)",
+		Long: "Stops the background session on <from-profile>, then re-dispatches its conversation\n" +
+			"as a new background session on <to-profile> via `claude --bg --resume`. Use when one\n" +
+			"account's usage limits are exhausted and the work must continue on another.\n" +
+			"Accepts the full session UUID or the 8-char short id shown by `claude agents`.",
+		Args: cobra.ExactArgs(3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			sessionID, fromName, toName := args[0], args[1], args[2]
+
+			cfg, err := internal.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+			fromProfile, ok := cfg.Profiles[fromName]
+			if !ok {
+				return fmt.Errorf("unknown profile %q (available: %s)", fromName, strings.Join(sortedKeys(cfg.Profiles), ", "))
+			}
+			toProfile, ok := cfg.Profiles[toName]
+			if !ok {
+				return fmt.Errorf("unknown profile %q (available: %s)", toName, strings.Join(sortedKeys(cfg.Profiles), ", "))
+			}
+
+			profilesBase := internal.ProfilesBaseDir(configPath)
+			if name == "" {
+				short := sessionID
+				if len(short) > 8 {
+					short = short[:8]
+				}
+				name = "handoff-" + short
+			}
+			return internal.HandoffSession(
+				fromName, filepath.Join(profilesBase, fromName), fromProfile,
+				toName, filepath.Join(profilesBase, toName), toProfile,
+				sessionID, prompt, name,
+			)
+		},
+	}
+	cmd.Flags().StringVar(&prompt, "prompt", "Continue the previous task from exactly where it left off. Ignore hook housekeeping notices.", "prompt for the re-dispatched session's first turn")
+	cmd.Flags().StringVar(&name, "name", "", "name for the new background session (default: handoff-<short-id>)")
+	return cmd
 }
 
 func cloneCmd() *cobra.Command {
