@@ -9,8 +9,11 @@ import (
 )
 
 // runBypass lists the claude subcommands that must be passed straight through
-// without the profile's --add-dir/--model decoration. Kept in sync with the
-// historical bash-wrapper "subcommands" list.
+// without the profile's --add-dir/--model/--args decoration. This is the
+// single source of truth: wrapper_unix.go's bypassCasePattern() renders it as
+// the bash case pattern, so the two paths cannot silently drift apart again
+// (a hand-copied literal there once did, missing every subcommand added here
+// after the initial cut).
 //
 // This must cover EVERY claude subcommand, including the hidden daemon-session
 // ones (attach/logs/stop/respawn/daemon): claude's CLI does not parse flags
