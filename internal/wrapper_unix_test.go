@@ -96,7 +96,9 @@ func TestGenerateWrapperSubcommandBypass(t *testing.T) {
 // The bash case pattern is derived from runBypass (exec_run.go) so it can't
 // stand still while that map grows. Regression guard for the drift where this
 // list was hand-copied once and then never updated when fix(run) 2026-07-15
-// added the hidden daemon-session subcommands to runBypass.
+// added the hidden daemon-session subcommands to runBypass, plus rm/config
+// added 2026-07-16 (doc-confirmed real subcommands; resume deliberately
+// excluded — it's the flag --resume, not a subcommand).
 func TestGenerateWrapperSubcommandBypassCoversNewerSubcommands(t *testing.T) {
 	profile := &Profile{Description: "Test"}
 	out := GenerateWrapper("test", "/profiles/test", profile)
@@ -104,6 +106,7 @@ func TestGenerateWrapperSubcommandBypassCoversNewerSubcommands(t *testing.T) {
 	for _, sub := range []string{
 		"attach", "logs", "stop", "respawn", "daemon",
 		"gateway", "project", "remote-control", "ultrareview",
+		"rm", "config",
 	} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("wrapper bypass list missing subcommand %q; got:\n%s", sub, out)

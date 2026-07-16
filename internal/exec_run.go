@@ -27,6 +27,12 @@ var runBypass = map[string]bool{
 	"attach": true, "logs": true, "stop": true, "respawn": true,
 	"daemon": true, "gateway": true, "project": true,
 	"remote-control": true, "ultrareview": true,
+	// rm and config are real claude subcommands (docs.claude.com agent-view
+	// reference; `claude config list` observed executing live on 2.1.210) —
+	// confirmed 2026-07-16. NOTE: `resume` is intentionally NOT here — the
+	// documented form is the flag `claude --resume <name>`, not a subcommand,
+	// so adding it would invent CLI surface that doesn't exist.
+	"rm": true, "config": true,
 }
 
 // BuildRunInvocation assembles everything needed to launch claude for a profile:
