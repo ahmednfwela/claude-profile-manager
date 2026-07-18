@@ -93,6 +93,80 @@ func TestGenerateWrapperSubcommandBypass(t *testing.T) {
 	}
 }
 
+// The bash case pattern is derived from runBypass (exec_run.go) so it can't
+// stand still while that map grows. Regression guard for the drift where this
+// list was hand-copied once and then never updated when fix(run) 2026-07-15
+// added the hidden daemon-session subcommands to runBypass, plus rm/config
+// added 2026-07-16 (doc-confirmed real subcommands; resume deliberately
+// excluded — it's the flag --resume, not a subcommand).
+func TestGenerateWrapperSubcommandBypassCoversNewerSubcommands(t *testing.T) {
+	profile := &Profile{Description: "Test"}
+	out := GenerateWrapper("test", "/profiles/test", profile)
+
+	for _, sub := range []string{
+		"attach", "logs", "stop", "respawn", "daemon",
+		"gateway", "project", "remote-control", "ultrareview",
+		"rm", "config",
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("wrapper bypass list missing subcommand %q; got:\n%s", sub, out)
+		}
+	}
+}
+
+// Regression guard: the bash launcher (unlike the Go `cpm run` path in
+// exec_run.go) never forwarded profile.Args, so a profile configured with
+// args = ["--dangerously-skip-permissions", ...] silently ran in default
+// permission mode (observed live on macOS 2026-07-16).
+func TestGenerateWrapperWithArgs(t *testing.T) {
+	profile := &Profile{
+		Description: "GLM",
+		Args:        []string{"--dangerously-skip-permissions", "--effort", "ultracode"},
+	}
+
+	out := GenerateWrapper("glm", "/profiles/glm", profile)
+
+	for _, want := range []string{"--dangerously-skip-permissions", "--effort", "ultracode"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("wrapper should forward profile arg %q; got:\n%s", want, out)
+		}
+	}
+}
+
+// A bypassed subcommand must not receive profile.Args either — same
+// invariant as TestBuildRunInvocationBypassSkipsArgs in exec_run_test.go, but
+// for the bash-generated path.
+func TestGenerateWrapperBypassSkipsArgs(t *testing.T) {
+	profile := &Profile{
+		Description: "GLM",
+		Args:        []string{"--dangerously-skip-permissions"},
+	}
+
+	out := GenerateWrapper("glm", "/profiles/glm", profile)
+
+	// The bypass line must come before the decorated exec line, and the
+	// bypass line itself must not carry the profile args.
+	bypassLine := out[strings.Index(out, "case \"${1:-}\""):strings.Index(out, "esac")]
+	if strings.Contains(bypassLine, "--dangerously-skip-permissions") {
+		t.Errorf("bypass case should not carry profile Args; got:\n%s", bypassLine)
+	}
+}
+
+func TestGenerateWrapperArgsAreShellQuoted(t *testing.T) {
+	profile := &Profile{
+		Description: "Quoting",
+		Args:        []string{"--append-system-prompt=it's fine"},
+	}
+
+	out := GenerateWrapper("quoting", "/profiles/quoting", profile)
+
+	// A literal, unescaped embedded single quote would prematurely close the
+	// generated script's quoted literal and break the script.
+	if !strings.Contains(out, `'\''`) {
+		t.Errorf("embedded single quote should be escaped; got:\n%s", out)
+	}
+}
+
 // LauncherFileName on Unix is the bare claude-<name>.
 func TestLauncherFileNameUnix(t *testing.T) {
 	if got := LauncherFileName("glm"); got != "claude-glm" {
