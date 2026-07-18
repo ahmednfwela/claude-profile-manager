@@ -8,7 +8,32 @@ import (
 	"strings"
 )
 
-var subcommands = "mcp|auth|doctor|install|setup-token|update|upgrade|agents|auto-mode|plugin|plugins"
+// bypassCasePattern renders runBypass (defined in exec_run.go — the single
+// source of truth also used by BuildRunInvocation/`cpm run`) as a sorted
+// "a|b|c" bash case pattern. Deriving it from the map instead of hand-copying
+// a second literal is the fix: the bash list previously stood still at the
+// original 11 subcommands while runBypass grew to include the hidden
+// daemon-session ones (attach/logs/stop/respawn/daemon) plus
+// gateway/project/remote-control/ultrareview (fix(run) 2026-07-15), so a
+// decorated `claude-<profile> stop <id>` was parsed as a PROMPT instead of
+// bypassing to the real subcommand.
+func bypassCasePattern() string {
+	names := make([]string, 0, len(runBypass))
+	for name := range runBypass {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, "|")
+}
+
+// shellQuote wraps s in single quotes for safe inclusion in the generated
+// bash script, escaping any embedded single quotes. profile.Args are baked
+// into the script as literals (unlike "$@", which bash forwards at runtime),
+// so an unquoted arg containing whitespace or a shell metacharacter would
+// either split into multiple words or break the script.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
 
 // LauncherFileName is the on-PATH launcher name for a profile.
 func LauncherFileName(name string) string { return "claude-" + name }
@@ -51,7 +76,7 @@ func GenerateWrapper(name string, profileDir string, profile *Profile) string {
 	b.WriteString("\n")
 
 	// Subcommands bypass
-	b.WriteString(fmt.Sprintf("case \"${1:-}\" in\n  %s) exec claude \"$@\" ;;\nesac\n\n", subcommands))
+	b.WriteString(fmt.Sprintf("case \"${1:-}\" in\n  %s) exec claude \"$@\" ;;\nesac\n\n", bypassCasePattern()))
 
 	// Model handling
 	if profile.Model != "" {
@@ -74,6 +99,14 @@ func GenerateWrapper(name string, profileDir string, profile *Profile) string {
 
 	if profile.Model != "" {
 		cmdParts = append(cmdParts, fmt.Sprintf("$([ \"$has_model\" = false ] && echo '--model %s')", profile.Model))
+	}
+
+	// Profile-level extra flags (e.g. --dangerously-skip-permissions), mirroring
+	// BuildRunInvocation's ordering in exec_run.go: add-dirs, model, args, then
+	// the caller's own argv. The bypass case above returns before this point,
+	// so bypassed subcommands never receive them.
+	for _, a := range profile.Args {
+		cmdParts = append(cmdParts, shellQuote(a))
 	}
 
 	cmdParts = append(cmdParts, "\"$@\"")

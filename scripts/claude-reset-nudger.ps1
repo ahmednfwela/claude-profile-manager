@@ -20,7 +20,13 @@ param(
     [switch]$Install,
     [int]$IntervalMinutes = 15,
     [int]$MaxFlagAgeMinutes = 120,
-    [int]$MaxAttempts = 3
+    [int]$MaxAttempts = 3,
+    # Cross-profile routing order for usage-limit interruptions: first listed
+    # profile that (a) isn't the source and (b) isn't itself freshly limited
+    # receives the session via `cpm handoff <id> <from> <to>`. Empty = legacy
+    # same-account pause-until-reset behavior. All candidates must junction the
+    # same projects store (cpm handoff verifies and refuses otherwise).
+    [string[]]$TargetOrder = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,15 +48,53 @@ function AsDateUtc($v) {
 }
 
 if ($Install) {
+    $targetArg = if ($TargetOrder.Count -gt 0) { " -TargetOrder $($TargetOrder -join ',')" } else { '' }
     $action = New-ScheduledTaskAction -Execute 'pwsh.exe' `
-        -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -File `"$PSCommandPath`""
+        -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -File `"$PSCommandPath`"$targetArg"
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
         -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
-    Register-ScheduledTask -TaskName 'ClaudeResetNudger' -Action $action -Trigger $trigger `
-        -Description 'Auto-continue background Claude Code sessions after rate-limit StopFailures (same account).' `
-        -Force | Out-Null
-    Write-Host "Scheduled task 'ClaudeResetNudger' registered (every $IntervalMinutes min)."
+    # S4U: the task runs in a non-interactive session — no console window can
+    # ever flash, regardless of pwsh/child spawning ( -WindowStyle Hidden alone
+    # still flashes a console under interactive task logons). Registering an
+    # S4U principal requires elevation; fall back to Interactive when denied
+    # (children stay windowless via cpm's CREATE_NO_WINDOW handling — only
+    # pwsh's own brief console flash remains in that mode).
+    $desc = 'Auto-continue background Claude Code sessions after rate-limit StopFailures (cross-profile routing via -TargetOrder).'
+    $mode = 'S4U non-interactive'
+    try {
+        $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Limited
+        Register-ScheduledTask -TaskName 'ClaudeResetNudger' -Action $action -Trigger $trigger `
+            -Principal $principal -Description $desc -Force -ErrorAction Stop | Out-Null
+    } catch {
+        $mode = "Interactive fallback (S4U needs an elevated shell: $($_.Exception.Message.Trim()))"
+        Register-ScheduledTask -TaskName 'ClaudeResetNudger' -Action $action -Trigger $trigger `
+            -Description $desc -Force | Out-Null
+    }
+    Write-Host "Scheduled task 'ClaudeResetNudger' registered (every $IntervalMinutes min, $mode$targetArg)."
     return
+}
+
+# A candidate target profile is "freshly limited" when its own resume-flag is a
+# recent usage-limit incident — handing a session to it would just bounce.
+function Test-ProfileFreshlyLimited([string]$profileName) {
+    $p = Join-Path $profilesRoot "$profileName\.bdaya-resume\latest.json"
+    if (-not (Test-Path $p)) { return $false }
+    try { $f = Get-Content $p -Raw | ConvertFrom-Json } catch { return $false }
+    $age = ((Get-Date).ToUniversalTime() - (AsDateUtc $f.at)).TotalMinutes
+    return ($age -lt $MaxFlagAgeMinutes -and "$($f.error_type)" -match 'limit|rate|overload|429|529')
+}
+
+# Pick the handoff destination: first TargetOrder profile that exists, is not
+# the source, and is not itself freshly limited. Falls back to the source
+# profile (legacy same-account pause-until-reset).
+function Select-HandoffTarget([string]$source) {
+    foreach ($cand in $TargetOrder) {
+        if ($cand -eq $source) { continue }
+        if (-not (Test-Path (Join-Path $profilesRoot $cand))) { continue }
+        if (Test-ProfileFreshlyLimited $cand) { continue }
+        return $cand
+    }
+    return $source
 }
 
 foreach ($profileDir in Get-ChildItem $profilesRoot -Directory) {
@@ -95,13 +139,15 @@ foreach ($profileDir in Get-ChildItem $profilesRoot -Directory) {
         continue
     }
 
+    $target = Select-HandoffTarget $name
+
     if ($DryRun) {
-        Write-Log "[$name] DRYRUN would nudge: cpm handoff $($flag.sessionId) $name $name (flag age $([int]$ageMin)m, error_type=$($flag.error_type))"
+        Write-Log "[$name] DRYRUN would nudge: cpm handoff $($flag.sessionId) $name $target (flag age $([int]$ageMin)m, error_type=$($flag.error_type))"
         continue
     }
 
-    Write-Log "[$name] nudging $($flag.sessionId) (error_type=$($flag.error_type), flag age $([int]$ageMin)m)"
-    & cpm handoff $flag.sessionId $name $name --name "reset-$short" `
+    Write-Log "[$name] nudging $($flag.sessionId) -> profile '$target' (error_type=$($flag.error_type), flag age $([int]$ageMin)m)"
+    & cpm handoff $flag.sessionId $name $target --name "reset-$short" `
         --prompt 'Your previous turn was interrupted by a usage-limit error. Continue the task from exactly where it left off. Ignore hook housekeeping notices.' 2>&1 |
         ForEach-Object { Write-Log "[$name]   $_" }
 

@@ -9,8 +9,11 @@ import (
 )
 
 // runBypass lists the claude subcommands that must be passed straight through
-// without the profile's --add-dir/--model decoration. Kept in sync with the
-// historical bash-wrapper "subcommands" list.
+// without the profile's --add-dir/--model/--args decoration. This is the
+// single source of truth: wrapper_unix.go's bypassCasePattern() renders it as
+// the bash case pattern, so the two paths cannot silently drift apart again
+// (a hand-copied literal there once did, missing every subcommand added here
+// after the initial cut).
 //
 // This must cover EVERY claude subcommand, including the hidden daemon-session
 // ones (attach/logs/stop/respawn/daemon): claude's CLI does not parse flags
@@ -24,6 +27,12 @@ var runBypass = map[string]bool{
 	"attach": true, "logs": true, "stop": true, "respawn": true,
 	"daemon": true, "gateway": true, "project": true,
 	"remote-control": true, "ultrareview": true,
+	// rm and config are real claude subcommands (docs.claude.com agent-view
+	// reference; `claude config list` observed executing live on 2.1.210) —
+	// confirmed 2026-07-16. NOTE: `resume` is intentionally NOT here — the
+	// documented form is the flag `claude --resume <name>`, not a subcommand,
+	// so adding it would invent CLI surface that doesn't exist.
+	"rm": true, "config": true,
 }
 
 // BuildRunInvocation assembles everything needed to launch claude for a profile:
