@@ -98,6 +98,21 @@ $log = Invoke-Nudger $fix @('pA', 'pB')
 Assert ($log -match 'as reset-deadbeef-h2 ') 'hop 2 named reset-<root>-h2'
 Assert ($log -match 'lineage deadbeef hop 2') 'attempt attributed to the chain root'
 
+Write-Host "scenario: malformed ledger entries are skipped, not fatal"
+$fix = New-Fixture
+$flagAt = $nowUtc.AddMinutes(-10)
+Add-ProfileFixture $fix 'pA' 'ffff6666-0000-4000-8000-000000000006' $flagAt `
+    -jobName 'reset-deadbeef' -jobCreatedAtUtc $flagAt.AddHours(-2)
+# one entry missing `at`, one with garbage `at`, one valid — only the valid one
+# may count; the run must complete instead of aborting on a parse throw
+@(
+    @{ lineage = 'deadbeef'; sessionId = 'bad1'; profile = 'pX' },
+    @{ lineage = 'deadbeef'; sessionId = 'bad2'; profile = 'pX'; at = 'not-a-date' },
+    @{ lineage = 'deadbeef'; sessionId = 'hop1'; profile = 'pX'; at = $nowUtc.AddHours(-1).ToString('o') }
+) | ConvertTo-Json -AsArray | Set-Content (Join-Path $fix '.claude\reset-nudger-lineage.json')
+$log = Invoke-Nudger $fix @('pA', 'pB')
+Assert ($log -match 'lineage deadbeef hop 2') 'only the valid entry counted; run completed'
+
 Write-Host ''
 if ($script:failed -gt 0) { Write-Host "$($script:failed) assertion(s) FAILED" -ForegroundColor Red; exit 1 }
 Write-Host 'all assertions passed'

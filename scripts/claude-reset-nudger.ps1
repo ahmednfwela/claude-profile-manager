@@ -140,12 +140,18 @@ function Get-LineageKey($jobRecord, [string]$sessionId) {
     return $sessionId.Substring(0, 8)
 }
 
+# A malformed entry (missing/garbage `at`) must be skipped, not thrown on —
+# under ErrorActionPreference=Stop an unhandled parse would abort every
+# future scheduled run until someone clears the ledger by hand.
+function Test-EntryFresh($entry, [int]$windowHours) {
+    if (-not ($entry -and $entry.at)) { return $false }
+    try { return ((AsDateUtc $entry.at) -gt (Get-Date).ToUniversalTime().AddHours(-$windowHours)) } catch { return $false }
+}
+
 function Get-LineageAttempts([string]$lineage) {
     if (-not (Test-Path $lineageLedgerPath)) { return @() }
     try { $ledger = Get-Content $lineageLedgerPath -Raw | ConvertFrom-Json } catch { return @() }
-    return @($ledger | Where-Object {
-        $_.lineage -eq $lineage -and (AsDateUtc $_.at) -gt (Get-Date).ToUniversalTime().AddHours(-24)
-    })
+    return @($ledger | Where-Object { $_ -and $_.lineage -eq $lineage -and (Test-EntryFresh $_ 24) })
 }
 
 function Add-LineageAttempt([string]$lineage, [string]$sessionId, [string]$profileName) {
@@ -153,8 +159,9 @@ function Add-LineageAttempt([string]$lineage, [string]$sessionId, [string]$profi
     if (Test-Path $lineageLedgerPath) {
         try { $ledger = @(Get-Content $lineageLedgerPath -Raw | ConvertFrom-Json) } catch { $ledger = @() }
     }
-    # keep 48h (cap window is 24h; the rest is post-mortem context)
-    $ledger = @($ledger | Where-Object { $_ -and (AsDateUtc $_.at) -gt (Get-Date).ToUniversalTime().AddHours(-48) })
+    # keep 48h (cap window is 24h; the rest is post-mortem context);
+    # malformed entries are dropped rather than thrown on
+    $ledger = @($ledger | Where-Object { Test-EntryFresh $_ 48 })
     $ledger += @{ lineage = $lineage; sessionId = $sessionId; profile = $profileName; at = (Get-Date).ToUniversalTime().ToString('o') }
     ConvertTo-Json @($ledger) -Depth 5 -AsArray | Set-Content $lineageLedgerPath
 }
