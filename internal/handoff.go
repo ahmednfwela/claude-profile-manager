@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -52,9 +53,19 @@ func ResolveSessionID(id, fromDir string) (string, string, error) {
 // In headless contexts (scheduled tasks, hooks) children are spawned without
 // a console window — see hideIfHeadless — so automated handoffs never pop
 // terminal windows on Windows.
-func runClaudeInline(path string, argv, env []string) error {
+//
+// dir sets the child's working directory. It MUST be the session's original
+// project directory for the `--resume` re-dispatch: claude scopes session-id
+// lookup to the current directory and its worktrees ("session ID lookup is
+// scoped to the current project directory and its git worktrees, so a session
+// created elsewhere reports No conversation found" —
+// https://code.claude.com/docs/en/sessions). Launched from any other cwd,
+// `--bg --resume <id>` fails to find the id and forks a blank session. Pass ""
+// to inherit cpm's cwd (used only where scope is irrelevant).
+func runClaudeInline(path string, argv, env []string, dir string) error {
 	cmd := exec.Command(path, argv[1:]...)
 	cmd.Env = env
+	cmd.Dir = dir
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	hideIfHeadless(cmd)
 	return cmd.Run()
@@ -73,6 +84,46 @@ func verifyTranscriptVisible(toDir, fullID string) error {
 	return fmt.Errorf("transcript %s.jsonl not visible under %s\\projects — the profiles' projects stores are not shared (junction missing?); refusing to dispatch a blank session", fullID, toDir)
 }
 
+// sessionProjectDir returns the working directory the session was created in, by
+// reading the `cwd` field from its transcript. Store visibility (a shared
+// projects junction) is necessary but NOT sufficient to re-dispatch: because
+// `--resume` resolves the id relative to the launch cwd, the re-dispatch must
+// run in this directory or claude forks a blank session even though the
+// transcript is right there in the store. The first transcript line is a
+// `custom-title` record with a null cwd, so scan for the first line that
+// actually carries a non-empty cwd. Reversing the project slug is not an option
+// — slugging replaces every non-alphanumeric byte with '-' and is lossy — so
+// the transcript is the only authoritative source; refuse rather than guess.
+func sessionProjectDir(toDir, fullID string) (string, error) {
+	matches, err := filepath.Glob(filepath.Join(toDir, "projects", "*", fullID+".jsonl"))
+	if err != nil || len(matches) == 0 {
+		return "", fmt.Errorf("transcript %s.jsonl not visible under %s\\projects — the profiles' projects stores are not shared (junction missing?); refusing to dispatch a blank session", fullID, toDir)
+	}
+	f, err := os.Open(matches[0])
+	if err != nil {
+		return "", fmt.Errorf("open transcript %s: %w", matches[0], err)
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024) // transcript lines can be large
+	for sc.Scan() {
+		var rec struct {
+			Cwd string `json:"cwd"`
+		}
+		if err := json.Unmarshal(sc.Bytes(), &rec); err != nil {
+			continue // skip any non-JSON / partial line
+		}
+		if rec.Cwd != "" {
+			return rec.Cwd, nil
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", fmt.Errorf("read transcript %s: %w", matches[0], err)
+	}
+	return "", fmt.Errorf("no cwd found in transcript %s — cannot determine the session's project directory; refusing to re-dispatch where --resume would fork a blank session", matches[0])
+}
+
 // HandoffSession moves a background session between profiles/accounts: it
 // stops the worker on the source profile, then re-dispatches the conversation
 // as a new background session on the target profile via `claude --bg --resume`.
@@ -87,31 +138,38 @@ func HandoffSession(fromName, fromDir string, fromProfile *Profile, toName, toDi
 		return err
 	}
 
+	// Resolve the session's project directory up front and fail fast: this both
+	// proves the transcript is visible (shared projects store) AND yields the
+	// cwd the --resume re-dispatch must run in. Doing it before the stop means a
+	// mis-wired store aborts the handoff without needlessly killing the source
+	// worker.
+	projectDir, err := sessionProjectDir(toDir, fullID)
+	if err != nil {
+		return err
+	}
+
 	// Stop on the source profile. Best-effort: the session may already be
-	// stopped (that's the typical rate-limited state) or finished.
+	// stopped (that's the typical rate-limited state) or finished. Run it in the
+	// session's project dir so the daemon subcommand resolves the same scope.
 	stopPath, stopArgv, stopEnv, err := BuildRunInvocation(fromName, fromDir, fromProfile, []string{"stop", shortID})
 	if err != nil {
 		return err
 	}
 	fmt.Printf("stopping %s on profile %q...\n", shortID, fromName)
-	if err := runClaudeInline(stopPath, stopArgv, stopEnv); err != nil {
+	if err := runClaudeInline(stopPath, stopArgv, stopEnv, projectDir); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: stop on %q failed (%v) — continuing; verify no live worker still owns the session\n", fromName, err)
-	}
-
-	// The target must be able to read the transcript, or --resume silently
-	// forks a blank session (mis-route). Fail precisely instead.
-	if err := verifyTranscriptVisible(toDir, fullID); err != nil {
-		return err
 	}
 
 	// Re-dispatch on the target profile. Decoration (profile Args like
 	// --dangerously-skip-permissions) is wanted here: --bg forwards it into
-	// the worker's launch args and respawnFlags.
+	// the worker's launch args and respawnFlags. The re-dispatch MUST run in the
+	// session's project dir — claude scopes --resume id lookup to the launch cwd,
+	// so any other directory forks a blank session (see runClaudeInline).
 	bgArgs := []string{"--bg", prompt, "--resume", fullID, "--name", name}
 	bgPath, bgArgv, bgEnv, err := BuildRunInvocation(toName, toDir, toProfile, bgArgs)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("re-dispatching %s on profile %q as %q...\n", fullID, toName, name)
-	return runClaudeInline(bgPath, bgArgv, bgEnv)
+	fmt.Printf("re-dispatching %s on profile %q as %q (cwd %s)...\n", fullID, toName, name, projectDir)
+	return runClaudeInline(bgPath, bgArgv, bgEnv, projectDir)
 }
