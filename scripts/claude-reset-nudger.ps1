@@ -29,6 +29,12 @@ param(
     [string[]]$TargetOrder = @()
 )
 
+# Normalize -TargetOrder: `pwsh -File script.ps1 -TargetOrder digrum,gmail` (the
+# scheduled-task launch shape, direct or via the wscript launcher) binds the whole
+# comma-list as ONE array element, so profile matching in Select-HandoffTarget
+# silently never fires. Split any element on commas so both launch shapes work.
+$TargetOrder = @($TargetOrder | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+
 $ErrorActionPreference = 'Stop'
 $profilesRoot = Join-Path $env:USERPROFILE '.claude-profiles'
 $logFile = Join-Path $env:USERPROFILE '.claude\reset-nudger.log'
