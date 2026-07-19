@@ -49,25 +49,33 @@ function AsDateUtc($v) {
 
 if ($Install) {
     $targetArg = if ($TargetOrder.Count -gt 0) { " -TargetOrder $($TargetOrder -join ',')" } else { '' }
-    $action = New-ScheduledTaskAction -Execute 'pwsh.exe' `
-        -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -File `"$PSCommandPath`"$targetArg"
+    $pwshArgs = "-NoProfile -NonInteractive -File `"$PSCommandPath`"$targetArg"
+    $s4uAction = New-ScheduledTaskAction -Execute 'pwsh.exe' -Argument "-WindowStyle Hidden $pwshArgs"
+    $hiddenLauncher = Join-Path $PSScriptRoot 'hidden-launch.vbs'
+    $fallbackAction = New-ScheduledTaskAction -Execute 'wscript.exe' `
+        -Argument "`"$hiddenLauncher`" pwsh.exe $pwshArgs"
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
         -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
     # S4U: the task runs in a non-interactive session — no console window can
     # ever flash, regardless of pwsh/child spawning ( -WindowStyle Hidden alone
     # still flashes a console under interactive task logons). Registering an
-    # S4U principal requires elevation; fall back to Interactive when denied
-    # (children stay windowless via cpm's CREATE_NO_WINDOW handling — only
-    # pwsh's own brief console flash remains in that mode).
+    # S4U principal requires elevation; fall back to Interactive when denied.
+    # The Interactive fallback routes pwsh through scripts/hidden-launch.vbs, a
+    # wscript.exe GUI-subsystem launcher (wscript never allocates a console, so
+    # its `.Run cmd, 0, False` hides the child unconditionally) instead of
+    # invoking pwsh.exe directly — so the fallback is ALSO zero-flash and needs
+    # no elevation (children stay windowless via cpm's CREATE_NO_WINDOW
+    # handling either way). hidden-launch.vbs must sit next to this script
+    # ($PSScriptRoot) — copy both files together.
     $desc = 'Auto-continue background Claude Code sessions after rate-limit StopFailures (cross-profile routing via -TargetOrder).'
     $mode = 'S4U non-interactive'
     try {
         $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Limited
-        Register-ScheduledTask -TaskName 'ClaudeResetNudger' -Action $action -Trigger $trigger `
+        Register-ScheduledTask -TaskName 'ClaudeResetNudger' -Action $s4uAction -Trigger $trigger `
             -Principal $principal -Description $desc -Force -ErrorAction Stop | Out-Null
     } catch {
-        $mode = "Interactive fallback (S4U needs an elevated shell: $($_.Exception.Message.Trim()))"
-        Register-ScheduledTask -TaskName 'ClaudeResetNudger' -Action $action -Trigger $trigger `
+        $mode = "Interactive fallback, zero-flash via wscript hidden launcher (S4U needs an elevated shell: $($_.Exception.Message.Trim()))"
+        Register-ScheduledTask -TaskName 'ClaudeResetNudger' -Action $fallbackAction -Trigger $trigger `
             -Description $desc -Force | Out-Null
     }
     Write-Host "Scheduled task 'ClaudeResetNudger' registered (every $IntervalMinutes min, $mode$targetArg)."

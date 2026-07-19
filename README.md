@@ -187,12 +187,14 @@ The `.claude-profile` file is automatically added to `.gitignore`.
 
 `cpm handoff <session-id> <from> <to>` stops a background session on one profile and re-dispatches its conversation on another via `claude --bg --resume` — useful when one account's usage limits are exhausted. Passing the same profile twice re-forks on the same account. Requires the profiles to share one projects store (junction/symlink `<profile>/projects` to a common directory).
 
-`scripts/claude-reset-nudger.ps1` (Windows) automates the same-account case: a scheduled task that watches each profile for rate-limit interruption flags and re-forks affected background sessions once. Copy it somewhere stable and run with `-Install`:
+`scripts/claude-reset-nudger.ps1` (Windows) automates the same-account case: a scheduled task that watches each profile for rate-limit interruption flags and re-forks affected background sessions once. Copy it (and `scripts/hidden-launch.vbs`, which must sit next to it) somewhere stable and run with `-Install`:
 
 ```powershell
-Copy-Item scripts\claude-reset-nudger.ps1 $env:USERPROFILE\.local\bin\
+Copy-Item scripts\claude-reset-nudger.ps1,scripts\hidden-launch.vbs $env:USERPROFILE\.local\bin\
 pwsh -File $env:USERPROFILE\.local\bin\claude-reset-nudger.ps1 -Install
 ```
+
+`-Install` registers a zero-flash scheduled task either way: it first tries an S4U (non-interactive) principal, which needs an elevated shell; without elevation it falls back to an Interactive-logon task whose action routes through `hidden-launch.vbs` (a `wscript.exe` GUI-subsystem launcher) instead of invoking `pwsh.exe` directly, so no console window flashes in either mode.
 
 Rails: background sessions only, flags older than 2h ignored, one nudge per flag, max 3 attempts per session per 24h. The flag format (`.bdaya-resume/latest.json`: `{error_type, sessionId, at}`) is written by an external hook on StopFailure.
 
