@@ -6,11 +6,16 @@
 # (scheduled every 15 min) picks up FRESH flags whose session is a BACKGROUND
 # worker in that profile and re-forks it on the same account via
 # `cpm handoff <id> <profile> <profile>` (stop + `claude --bg --resume`).
-# Claude's built-in retry backoff rides out any remaining limit window.
+# Claude's built-in retry backoff rides out a remaining rate-limit window, but
+# NOT a session-limit window — those forks die again on their first call.
 #
 # Safety rails: only background sessions (never forks your interactive work),
 # flags older than MaxFlagAgeMinutes are ignored, each flag `at` is nudged at
-# most once, and each session is nudged at most MaxAttempts times per 24h.
+# most once, each session is nudged at most MaxAttempts times per 24h, and —
+# because every re-fork gets a NEW session id — attempts are ALSO capped per
+# chain root ("lineage") in a machine-global ledger; a reset fork whose first
+# turn died within DeadOnArrivalSeconds of spawn pauses its chain instead of
+# bouncing to the next profile.
 #
 # Install the scheduled task:  claude-reset-nudger.ps1 -Install
 # Preview without acting:      claude-reset-nudger.ps1 -DryRun
@@ -21,6 +26,12 @@ param(
     [int]$IntervalMinutes = 15,
     [int]$MaxFlagAgeMinutes = 120,
     [int]$MaxAttempts = 3,
+    # A reset fork whose flag lands this soon after its spawn "died on
+    # arrival": the account it landed on is still limited, so re-forking would
+    # only bounce the session to the next profile and back. Observed
+    # 2026-07-19: session-limited forks died ~16s after spawn, every 15 min,
+    # for two hours (digrum<->gmail ping-pong).
+    [int]$DeadOnArrivalSeconds = 180,
     # Cross-profile routing order for usage-limit interruptions: first listed
     # profile that (a) isn't the source and (b) isn't itself freshly limited
     # receives the session via `cpm handoff <id> <from> <to>`. Empty = legacy
@@ -38,6 +49,9 @@ $TargetOrder = @($TargetOrder | ForEach-Object { $_ -split ',' } | Where-Object 
 $ErrorActionPreference = 'Stop'
 $profilesRoot = Join-Path $env:USERPROFILE '.claude-profiles'
 $logFile = Join-Path $env:USERPROFILE '.claude\reset-nudger.log'
+# Machine-global (NOT per-profile): a ping-pong chain alternates profiles, so
+# per-profile state can never cap it.
+$lineageLedgerPath = Join-Path $env:USERPROFILE '.claude\reset-nudger-lineage.json'
 
 function Write-Log([string]$msg) {
     $line = "$(Get-Date -Format o) $msg"
@@ -88,14 +102,79 @@ if ($Install) {
     return
 }
 
-# A candidate target profile is "freshly limited" when its own resume-flag is a
-# recent usage-limit incident — handing a session to it would just bounce.
+# A candidate target profile is "freshly limited" when it carries ANY fresh
+# incident flag — handing a session to it would just bounce. The old
+# error_type filter ('limit|rate|overload|429|529') let session-limit
+# incidents through: they reach the StopFailure hook untyped
+# (error_type=unknown), so a limited profile looked healthy and the handoff
+# ping-ponged between two limited accounts (proven 2026-07-19).
 function Test-ProfileFreshlyLimited([string]$profileName) {
     $p = Join-Path $profilesRoot "$profileName\.bdaya-resume\latest.json"
     if (-not (Test-Path $p)) { return $false }
     try { $f = Get-Content $p -Raw | ConvertFrom-Json } catch { return $false }
     $age = ((Get-Date).ToUniversalTime() - (AsDateUtc $f.at)).TotalMinutes
-    return ($age -lt $MaxFlagAgeMinutes -and "$($f.error_type)" -match 'limit|rate|overload|429|529')
+    return ($age -lt $MaxFlagAgeMinutes)
+}
+
+# ---- lineage loop guard -----------------------------------------------------
+# A nudge re-fork gets a NEW session id, so the per-session attempts cap
+# cannot see a chain: original -> reset fork -> reset fork -> ... Each hop
+# writes a fresh flag under its new id and the cap never accumulates
+# (observed 2026-07-19: a session-limited job ping-ponged digrum<->gmail every
+# 15 min for two hours — 7 hops, 7 session ids, zero cap hits). The guard
+# keys attempts on the chain ROOT ("lineage"), which rides the job name:
+# reset forks are named "reset-<rootShort>[-h<N>]".
+
+# Read a flagged session's job record (jobs\<short>\state.json) from its own
+# profile; $null when absent or unparsable.
+function Get-JobRecord([string]$profilePath, [string]$sessionId) {
+    $p = Join-Path $profilePath "jobs\$($sessionId.Substring(0, 8))\state.json"
+    if (-not (Test-Path $p)) { return $null }
+    try { Get-Content $p -Raw | ConvertFrom-Json } catch { $null }
+}
+
+# Lineage root short-id: from the job name for chain members, else the session
+# is itself a root.
+function Get-LineageKey($jobRecord, [string]$sessionId) {
+    if ($jobRecord -and "$($jobRecord.name)" -match '^reset-([0-9a-f]{8})') { return $Matches[1] }
+    return $sessionId.Substring(0, 8)
+}
+
+# A malformed entry (missing/garbage `at`) must be skipped, not thrown on —
+# under ErrorActionPreference=Stop an unhandled parse would abort every
+# future scheduled run until someone clears the ledger by hand.
+function Test-EntryFresh($entry, [int]$windowHours) {
+    if (-not ($entry -and $entry.at)) { return $false }
+    try { return ((AsDateUtc $entry.at) -gt (Get-Date).ToUniversalTime().AddHours(-$windowHours)) } catch { return $false }
+}
+
+function Get-LineageAttempts([string]$lineage) {
+    if (-not (Test-Path $lineageLedgerPath)) { return @() }
+    try { $ledger = Get-Content $lineageLedgerPath -Raw | ConvertFrom-Json } catch { return @() }
+    return @($ledger | Where-Object { $_ -and $_.lineage -eq $lineage -and (Test-EntryFresh $_ 24) })
+}
+
+function Add-LineageAttempt([string]$lineage, [string]$sessionId, [string]$profileName) {
+    $ledger = @()
+    if (Test-Path $lineageLedgerPath) {
+        try { $ledger = @(Get-Content $lineageLedgerPath -Raw | ConvertFrom-Json) } catch { $ledger = @() }
+    }
+    # keep 48h (cap window is 24h; the rest is post-mortem context);
+    # malformed entries are dropped rather than thrown on
+    $ledger = @($ledger | Where-Object { Test-EntryFresh $_ 48 })
+    $ledger += @{ lineage = $lineage; sessionId = $sessionId; profile = $profileName; at = (Get-Date).ToUniversalTime().ToString('o') }
+    ConvertTo-Json @($ledger) -Depth 5 -AsArray | Set-Content $lineageLedgerPath
+}
+
+# Dead-on-arrival: the flagged session is itself a reset fork whose first turn
+# died within seconds of spawn — the account it landed on is still limited,
+# and the built-in backoff does NOT ride out session-limit windows, so
+# re-forking would only bounce it onward. Pause the chain instead.
+function Test-DeadOnArrival($jobRecord, $flagAt) {
+    if (-not $jobRecord -or "$($jobRecord.name)" -notmatch '^reset-') { return $false }
+    if (-not $jobRecord.createdAt) { return $false }
+    $lifeSec = ((AsDateUtc $flagAt) - (AsDateUtc $jobRecord.createdAt)).TotalSeconds
+    return ($lifeSec -ge 0 -and $lifeSec -lt $DeadOnArrivalSeconds)
 }
 
 # Pick the handoff destination: first TargetOrder profile that exists, is not
@@ -153,18 +232,52 @@ foreach ($profileDir in Get-ChildItem $profilesRoot -Directory) {
         continue
     }
 
-    $target = Select-HandoffTarget $name
+    $job = Get-JobRecord $profileDir.FullName $flag.sessionId
+    $lineage = Get-LineageKey $job $flag.sessionId
 
-    if ($DryRun) {
-        Write-Log "[$name] DRYRUN would nudge: cpm handoff $($flag.sessionId) $name $target (flag age $([int]$ageMin)m, error_type=$($flag.error_type))"
+    # Loop guard 1 — dead-on-arrival fork: the previous hop died seconds after
+    # spawn, so every routable account is still limited. Pause the chain for
+    # manual /bdaya-resume instead of bouncing it to another profile.
+    if (Test-DeadOnArrival $job $flag.at) {
+        $lifeSec = [int](((AsDateUtc $flag.at) - (AsDateUtc $job.createdAt)).TotalSeconds)
+        Write-Log "[$name] $($flag.sessionId): reset fork died ${lifeSec}s after spawn (lineage $lineage) — account still limited, pausing chain for manual /bdaya-resume"
+        if (-not $DryRun) {
+            @{ lastHandledAt = $flagAtStr; attempts = @($state.attempts | Where-Object { $_ }) } | ConvertTo-Json -Depth 5 | Set-Content $statePath
+        }
         continue
     }
 
-    Write-Log "[$name] nudging $($flag.sessionId) -> profile '$target' (error_type=$($flag.error_type), flag age $([int]$ageMin)m)"
-    & cpm handoff $flag.sessionId $name $target --name "reset-$short" `
+    # Loop guard 2 — lineage cap: attempts count against the chain ROOT in the
+    # machine-global ledger, so a chain that alternates profiles (fresh session
+    # id + fresh flag every hop) still runs out of attempts.
+    $lineageAttempts = @(Get-LineageAttempts $lineage)
+    if ($lineageAttempts.Count -ge $MaxAttempts) {
+        Write-Log "[$name] $($flag.sessionId): lineage cap reached ($($lineageAttempts.Count)/24h for root $lineage) — leaving for manual /bdaya-resume"
+        if (-not $DryRun) {
+            @{ lastHandledAt = $flagAtStr; attempts = @($state.attempts | Where-Object { $_ }) } | ConvertTo-Json -Depth 5 | Set-Content $statePath
+        }
+        continue
+    }
+
+    $target = Select-HandoffTarget $name
+
+    # Stable lineage naming: every hop keeps the ROOT short-id in its name
+    # (hop counter for uniqueness), so the chain stays traceable and the
+    # lineage key survives any number of hops across any profiles.
+    $hop = $lineageAttempts.Count + 1
+    $forkName = if ($hop -le 1) { "reset-$lineage" } else { "reset-$lineage-h$hop" }
+
+    if ($DryRun) {
+        Write-Log "[$name] DRYRUN would nudge: cpm handoff $($flag.sessionId) $name $target as $forkName (flag age $([int]$ageMin)m, error_type=$($flag.error_type), lineage $lineage hop $hop)"
+        continue
+    }
+
+    Write-Log "[$name] nudging $($flag.sessionId) -> profile '$target' as $forkName (error_type=$($flag.error_type), flag age $([int]$ageMin)m, lineage $lineage hop $hop)"
+    & cpm handoff $flag.sessionId $name $target --name $forkName `
         --prompt 'Your previous turn was interrupted by a usage-limit error. Continue the task from exactly where it left off. Ignore hook housekeeping notices.' 2>&1 |
         ForEach-Object { Write-Log "[$name]   $_" }
 
+    Add-LineageAttempt $lineage $flag.sessionId $name
     $newAttempts = @($state.attempts | Where-Object { $_ }) + @(@{ sessionId = $flag.sessionId; at = (Get-Date -Format o) })
     @{ lastHandledAt = $flagAtStr; attempts = $newAttempts } | ConvertTo-Json -Depth 5 | Set-Content $statePath
 }
