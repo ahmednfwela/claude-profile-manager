@@ -187,7 +187,7 @@ The `.claude-profile` file is automatically added to `.gitignore`.
 
 `cpm handoff <session-id> <from> <to>` stops a background session on one profile and re-dispatches its conversation on another via `claude --bg --resume` — useful when one account's usage limits are exhausted. Passing the same profile twice re-forks on the same account. Requires the profiles to share one projects store (junction/symlink `<profile>/projects` to a common directory).
 
-The re-dispatched session keeps the origin session's name (read from the source profile's `jobs/<short-id>/state.json`; `--name` overrides it, and `handoff-<short-id>` is used only when the origin has no recorded name). If the origin session had a Workflow in flight — a detached process that dies with the stop — the re-dispatch prompt is augmented with its `runId` and `scriptPath` so the resumed session resumes it via `Workflow({scriptPath, resumeFromRunId})` instead of silently dropping the run.
+The re-dispatched session keeps the origin session's name (read from the source profile's `jobs/<short-id>/state.json`; `--name` overrides it, and `handoff-<short-id>` is used only when the origin has no recorded name). If the origin session had a Workflow in flight (a detached process that dies with the stop), the re-dispatch prompt is augmented with its `runId` and `scriptPath` so the resumed session resumes it via `Workflow({scriptPath, resumeFromRunId})` instead of silently dropping the run.
 
 `scripts/claude-reset-nudger.ps1` (Windows) automates the same-account case: a scheduled task that watches each profile for rate-limit interruption flags and re-forks affected background sessions once. Copy it (and `scripts/hidden-launch.vbs`, which must sit next to it) somewhere stable and run with `-Install`:
 
