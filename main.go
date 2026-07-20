@@ -435,14 +435,9 @@ func handoffCmd() *cobra.Command {
 				return fmt.Errorf("unknown profile %q (available: %s)", toName, strings.Join(sortedKeys(cfg.Profiles), ", "))
 			}
 
+			// An empty name is resolved inside HandoffSession: the origin
+			// session's own name (jobs/<short>/state.json), else handoff-<short>.
 			profilesBase := internal.ProfilesBaseDir(configPath)
-			if name == "" {
-				short := sessionID
-				if len(short) > 8 {
-					short = short[:8]
-				}
-				name = "handoff-" + short
-			}
 			return internal.HandoffSession(
 				fromName, filepath.Join(profilesBase, fromName), fromProfile,
 				toName, filepath.Join(profilesBase, toName), toProfile,
@@ -451,7 +446,7 @@ func handoffCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&prompt, "prompt", "Continue the previous task from exactly where it left off. Ignore hook housekeeping notices.", "prompt for the re-dispatched session's first turn")
-	cmd.Flags().StringVar(&name, "name", "", "name for the new background session (default: handoff-<short-id>)")
+	cmd.Flags().StringVar(&name, "name", "", "name for the new background session (default: the origin session's name, else handoff-<short-id>)")
 	return cmd
 }
 

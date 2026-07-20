@@ -2,12 +2,14 @@ package internal
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 )
 
 var (
@@ -124,6 +126,157 @@ func sessionProjectDir(toDir, fullID string) (string, error) {
 	return "", fmt.Errorf("no cwd found in transcript %s — cannot determine the session's project directory; refusing to re-dispatch where --resume would fork a blank session", matches[0])
 }
 
+// ResolveHandoffName picks the name for the re-dispatched session. An explicit
+// --name override wins; otherwise the origin session's own name carries over
+// verbatim, read from the daemon job state <fromDir>/jobs/<shortID>/state.json
+// ("name" is the field `claude agents` shows). Only when the origin has no
+// recorded name does it fall back to the "handoff-<short>" slug -- a handoff
+// is the same task continuing on another account, so it should keep its name.
+func ResolveHandoffName(override, fromDir, shortID string) string {
+	if override != "" {
+		return override
+	}
+	if data, err := os.ReadFile(filepath.Join(fromDir, "jobs", shortID, "state.json")); err == nil {
+		var st struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(data, &st) == nil && st.Name != "" {
+			return st.Name
+		}
+	}
+	return "handoff-" + shortID
+}
+
+// workflowLaunch is one Workflow-tool launch found in a session transcript.
+// The launch tool_result prints (verified against real transcripts):
+//
+//	Workflow launched in background. Task ID: <taskID>
+//	...
+//	Script file: <scriptPath>
+//	...
+//	Run ID: wf_<...>
+//
+// and the workflow's terminal signal is a later <task-notification> line
+// carrying the same task id in a <task-id> tag.
+type workflowLaunch struct {
+	line       int
+	taskID     string
+	runID      string
+	scriptPath string
+}
+
+var (
+	wfLaunchTaskRe = regexp.MustCompile(`Workflow launched in background\. Task ID: ([A-Za-z0-9_-]+)`)
+	wfRunIDRe      = regexp.MustCompile(`Run ID: (wf_[a-z0-9-]+)`)
+	wfScriptRe     = regexp.MustCompile(`(?m)^Script file: (.+?)\r?$`)
+)
+
+// collectStrings appends every string value reachable in a decoded JSON value,
+// so launch text is found whether the tool_result content is a plain string, a
+// list of content blocks, or echoed in a toolUseResult / queue-operation record.
+func collectStrings(v any, out *[]string) {
+	switch t := v.(type) {
+	case string:
+		*out = append(*out, t)
+	case []any:
+		for _, e := range t {
+			collectStrings(e, out)
+		}
+	case map[string]any:
+		for _, e := range t {
+			collectStrings(e, out)
+		}
+	}
+}
+
+// detectInFlightWorkflow scans a session transcript for the most recent
+// Workflow-tool launch that has no later terminal notification. A Workflow runs
+// as a detached process that dies when the session is stopped, and --resume
+// alone restores only the transcript -- so the handoff prompt must carry the
+// resume coordinates or the run is silently dropped.
+//
+// Best-effort by design: any read/parse problem returns nil and the handoff
+// proceeds unaugmented. On a partial read the launches seen so far still count:
+// resuming an already-finished workflow is a cheap cache no-op, while dropping
+// a live one is the data loss this exists to prevent.
+func detectInFlightWorkflow(transcriptPath string) *workflowLaunch {
+	f, err := os.Open(transcriptPath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	const launchMarker = "Workflow launched in background. Task ID: "
+	var launches []workflowLaunch
+	seen := map[string]bool{}    // launch taskID -> already recorded
+	terminal := map[string]int{} // taskID -> line its terminal notification was seen on
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024) // transcript lines can be large
+	for i := 0; sc.Scan(); i++ {
+		raw := sc.Bytes()
+		if bytes.Contains(raw, []byte(launchMarker)) {
+			var rec any
+			if json.Unmarshal(raw, &rec) == nil {
+				var texts []string
+				collectStrings(rec, &texts)
+				for _, txt := range texts {
+					if !strings.Contains(txt, launchMarker) {
+						continue
+					}
+					task := wfLaunchTaskRe.FindStringSubmatch(txt)
+					run := wfRunIDRe.FindStringSubmatch(txt)
+					script := wfScriptRe.FindStringSubmatch(txt)
+					if task == nil || run == nil || script == nil {
+						continue // e.g. a compaction summary quoting the launch text without its coordinates
+					}
+					if seen[task[1]] {
+						continue
+					}
+					seen[task[1]] = true
+					launches = append(launches, workflowLaunch{
+						line: i, taskID: task[1], runID: run[1],
+						scriptPath: strings.TrimSpace(script[1]),
+					})
+				}
+			}
+		}
+		// Terminal signal: the workflow's <task-notification> carries the same
+		// task id its launch printed. Task ids are alphanumeric, so JSON string
+		// escaping cannot split them -- raw containment is safe.
+		for _, l := range launches {
+			needle := "<task-id>" + l.taskID + "</task-id>"
+			if bytes.Contains(raw, []byte(needle)) {
+				terminal[l.taskID] = i
+			}
+		}
+	}
+	for i := len(launches) - 1; i >= 0; i-- {
+		if t, ok := terminal[launches[i].taskID]; !ok || t <= launches[i].line {
+			return &launches[i]
+		}
+	}
+	return nil
+}
+
+// augmentPromptForWorkflow appends the resume instruction for an in-flight
+// Workflow to the re-dispatch prompt. The journal caution matters: Workflow
+// resume looks the run's journal.jsonl up in the CURRENT session's transcript
+// directory, and a cache miss silently re-runs every agent from scratch
+// (observed: a naive handoff re-ran a 29/31-agent run in full).
+func augmentPromptForWorkflow(prompt string, wf *workflowLaunch) string {
+	if wf == nil {
+		return prompt
+	}
+	return fmt.Sprintf("%s A Workflow was in progress (runId %s, scriptPath %s). "+
+		"Resume it FIRST via Workflow({scriptPath: %q, resumeFromRunId: %q}) before anything else. "+
+		"Then verify the resume hit the run's cache: its journal.jsonl must list the previously "+
+		"completed agents as cached results. If agents start re-running from scratch, the journal "+
+		"was not found in this session's transcript directory - stop the run, copy the prior run's "+
+		"journal.jsonl and agent transcripts into the new run directory, and resume again.",
+		prompt, wf.runID, wf.scriptPath, wf.scriptPath, wf.runID)
+}
+
 // HandoffSession moves a background session between profiles/accounts: it
 // stops the worker on the source profile, then re-dispatches the conversation
 // as a new background session on the target profile via `claude --bg --resume`.
@@ -132,11 +285,15 @@ func sessionProjectDir(toDir, fullID string) (string, error) {
 // one directory), so the transcript is already visible to the target profile.
 // The stop MUST happen first: two profiles resuming one session means two
 // processes appending the same transcript file.
+//
+// An empty name resolves via ResolveHandoffName (origin session's own name,
+// else "handoff-<short>"); a non-empty name is the --name override and wins.
 func HandoffSession(fromName, fromDir string, fromProfile *Profile, toName, toDir string, toProfile *Profile, sessionID, prompt, name string) error {
 	fullID, shortID, err := ResolveSessionID(sessionID, fromDir)
 	if err != nil {
 		return err
 	}
+	name = ResolveHandoffName(name, fromDir, shortID)
 
 	// Resolve the session's project directory up front and fail fast: this both
 	// proves the transcript is visible (shared projects store) AND yields the
@@ -158,6 +315,17 @@ func HandoffSession(fromName, fromDir string, fromProfile *Profile, toName, toDi
 	fmt.Printf("stopping %s on profile %q...\n", shortID, fromName)
 	if err := runClaudeInline(stopPath, stopArgv, stopEnv, projectDir); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: stop on %q failed (%v) — continuing; verify no live worker still owns the session\n", fromName, err)
+	}
+
+	// A Workflow the origin session had in flight died with the stop above;
+	// --resume restores the transcript only, so the prompt must instruct the
+	// resumed session to pick the run back up. Best-effort: a failed scan
+	// changes nothing and the handoff proceeds with the prompt as given.
+	if matches, err := filepath.Glob(filepath.Join(toDir, "projects", "*", fullID+".jsonl")); err == nil && len(matches) > 0 {
+		if wf := detectInFlightWorkflow(matches[0]); wf != nil {
+			fmt.Printf("in-flight workflow %s detected - augmenting the re-dispatch prompt to resume it\n", wf.runID)
+			prompt = augmentPromptForWorkflow(prompt, wf)
+		}
 	}
 
 	// Re-dispatch on the target profile. Decoration (profile Args like
