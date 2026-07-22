@@ -17,7 +17,7 @@ var (
 	Commit  = "unknown"
 )
 
-const repoOwner = "jakubkontra"
+const repoOwner = "ahmednfwela"
 const repoName = "claude-profile-manager"
 
 // binaryName is the on-disk cpm binary name for the current OS.
