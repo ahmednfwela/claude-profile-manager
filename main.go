@@ -51,6 +51,8 @@ func main() {
 	root.AddCommand(versionCmd())
 	root.AddCommand(upgradeCmd())
 	root.AddCommand(cloudCmd())
+	root.AddCommand(addCmd())
+	root.AddCommand(fleetCmd())
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
@@ -108,8 +110,10 @@ func installCmd() *cobra.Command {
 					return fmt.Errorf("profile %s attribution: %w", name, err)
 				}
 
-				if err := internal.SyncMCPServers(profileDir); err != nil {
-					return fmt.Errorf("profile %s mcp sync: %w", name, err)
+				if cfg.ManageMCPEnabled() {
+					if err := internal.SyncMCPServers(profileDir); err != nil {
+						return fmt.Errorf("profile %s mcp sync: %w", name, err)
+					}
 				}
 
 				wrapper := internal.GenerateLauncher(name, profileDir, profile, cpmPath)
@@ -712,6 +716,76 @@ func cloudRemoteCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return internal.CloudRemote(configPath, args[0])
+		},
+	}
+}
+
+func addCmd() *cobra.Command {
+	var from string
+	var fleet bool
+
+	cmd := &cobra.Command{
+		Use:   "add <email> <alias>",
+		Short: "Add a new Claude account profile (clones a Max template + installs launcher)",
+		Long: "Add a new Claude account as an isolated profile.\n\n" +
+			"Clones args/env from a Max template (fleet.default_template, or the first\n" +
+			"Max profile, or --from), appends [profiles.<alias>] to config.toml, sets up\n" +
+			"the profile dir + launcher, and prints the /login step. Credentials are\n" +
+			"never created. With --fleet, the account is also added on every peer.",
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			email, alias := args[0], args[1]
+			cfg, err := internal.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+			if fleet {
+				return internal.AddProfileToFleet(cfg, configPath, email, alias, from)
+			}
+			return internal.AddProfile(cfg, configPath, email, alias, from)
+		},
+	}
+
+	cmd.Flags().StringVar(&from, "from", "", "template profile to clone args/env from (default: fleet.default_template or first Max profile)")
+	cmd.Flags().BoolVar(&fleet, "fleet", false, "also add this account on every configured fleet peer over SSH")
+	return cmd
+}
+
+func fleetCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "fleet",
+		Short: "Manage the multi-machine profile fleet (peers over SSH)",
+		Long:  "Reconcile the set of account profiles across machines declared under\n[fleet.peers] in config.toml. Each machine materializes profiles from its\nown template, so OS/filesystem conventions are respected automatically.",
+	}
+	cmd.AddCommand(fleetStatusCmd())
+	cmd.AddCommand(fleetSyncCmd())
+	return cmd
+}
+
+func fleetStatusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Show peer reachability and profile-set diffs",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := internal.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+			return internal.FleetStatus(cfg, configPath)
+		},
+	}
+}
+
+func fleetSyncCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "sync",
+		Short: "Reconcile the profile set across all fleet machines",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := internal.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+			return internal.FleetSync(cfg, configPath)
 		},
 	}
 }

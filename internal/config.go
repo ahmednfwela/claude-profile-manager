@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/BurntSushi/toml"
 )
@@ -15,6 +16,7 @@ type Attribution struct {
 
 type Profile struct {
 	Description string            `toml:"description"`
+	Email       string            `toml:"email"`
 	Model       string            `toml:"model"`
 	AddDirs     []string          `toml:"add_dirs"`
 	Args        []string          `toml:"args"`
@@ -28,11 +30,107 @@ type CloudConfig struct {
 	Exclude  []string `toml:"exclude"`
 }
 
+// FleetPeer describes another machine in the fleet, reachable over SSH.
+type FleetPeer struct {
+	Host       string `toml:"host"`        // SSH host/alias (resolved via ~/.ssh/config)
+	OS         string `toml:"os"`          // windows | darwin | linux (of the peer)
+	CPM        string `toml:"cpm"`         // path to the peer's cpm binary (default: "cpm" on PATH)
+	ConfigPath string `toml:"config_path"` // peer's config.toml (default: ~/.claude-profiles/config.toml)
+}
+
+// FleetConfig declares this machine's identity and its peer machines, so cpm can
+// reconcile the profile set across the fleet while respecting each machine's OS.
+type FleetConfig struct {
+	ID              string                `toml:"id"`               // this machine's name (informational)
+	OS              string                `toml:"os"`               // this machine's OS (informational; runtime.GOOS wins)
+	DefaultTemplate string                `toml:"default_template"` // profile to clone args/env from when adding accounts
+	Peers           map[string]*FleetPeer `toml:"peers"`
+}
+
+// RemoteConfigPath returns the peer's config.toml path, defaulting to the
+// conventional location when unset.
+func (p *FleetPeer) RemoteConfigPath() string {
+	if p.ConfigPath != "" {
+		return p.ConfigPath
+	}
+	return "~/.claude-profiles/config.toml"
+}
+
+// CPMBinary returns the peer's cpm invocation, defaulting to PATH resolution.
+func (p *FleetPeer) CPMBinary() string {
+	if p.CPM != "" {
+		return p.CPM
+	}
+	return "cpm"
+}
+
 type Config struct {
 	SourceDir string              `toml:"source_dir"`
 	BinDir    string              `toml:"bin_dir"`
+	ManageMCP *bool               `toml:"manage_mcp"` // default true; false => cpm never touches .claude.json mcpServers (gateway owns MCP)
 	Profiles  map[string]*Profile `toml:"profiles"`
 	Cloud     *CloudConfig        `toml:"cloud"`
+	Fleet     *FleetConfig        `toml:"fleet"`
+}
+
+// ManageMCPEnabled reports whether cpm should sync MCP servers into profiles.
+// Defaults to true; set `manage_mcp = false` when an external MCP proxy/gateway
+// is the sole owner of every profile's .claude.json mcpServers.
+func (c *Config) ManageMCPEnabled() bool {
+	return c.ManageMCP == nil || *c.ManageMCP
+}
+
+// IsMaxProfile reports whether a profile is a plain OAuth/subscription ("Max")
+// profile — i.e. it does NOT set a custom base URL or a static auth token. These
+// are the only profiles eligible to be an add-account template (never glm-class).
+func (p *Profile) IsMaxProfile() bool {
+	if p.Env == nil {
+		return true
+	}
+	for _, k := range []string{"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"} {
+		if _, ok := p.Env[k]; ok {
+			return false
+		}
+	}
+	return true
+}
+
+// TemplateProfileName resolves which profile to copy args/env from for a new
+// account. Precedence: explicit override → fleet.default_template → the
+// lexically-first Max profile. Returns an error if none is usable.
+func (c *Config) TemplateProfileName(explicit string) (string, error) {
+	if explicit != "" {
+		p, ok := c.Profiles[explicit]
+		if !ok {
+			return "", fmt.Errorf("template profile %q not found", explicit)
+		}
+		if !p.IsMaxProfile() {
+			return "", fmt.Errorf("template profile %q sets a custom base URL / token and is not a valid Max template", explicit)
+		}
+		return explicit, nil
+	}
+	if c.Fleet != nil && c.Fleet.DefaultTemplate != "" {
+		name := c.Fleet.DefaultTemplate
+		p, ok := c.Profiles[name]
+		if !ok {
+			return "", fmt.Errorf("fleet.default_template %q not found in profiles", name)
+		}
+		if !p.IsMaxProfile() {
+			return "", fmt.Errorf("fleet.default_template %q is not a valid Max template", name)
+		}
+		return name, nil
+	}
+	names := make([]string, 0, len(c.Profiles))
+	for n := range c.Profiles {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if c.Profiles[n].IsMaxProfile() {
+			return n, nil
+		}
+	}
+	return "", fmt.Errorf("no Max profile found to use as a template (add one, or pass --from)")
 }
 
 func DefaultConfigPath() string {
