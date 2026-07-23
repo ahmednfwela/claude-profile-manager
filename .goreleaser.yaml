@@ -33,16 +33,7 @@ changelog:
       - "^docs:"
       - "^test:"
 
-brews:
-  - repository:
-      owner: jakubkontra
-      name: homebrew-tap
-      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
-    name: cpm
-    homepage: "https://github.com/jakubkontra/claude-profile-manager"
-    description: "Claude Profile Manager — manage multiple Claude Code accounts"
-    license: "MIT"
-    install: |
-      bin.install "cpm"
-    test: |
-      system "#{bin}/cpm", "version"
+# NOTE: the upstream `brews:` block (pushing to jakubkontra/homebrew-tap) was
+# removed — this fork has no such tap and the cross-repo push has no valid token,
+# which would fail every tag-triggered release. Distribution here is the raw
+# GitHub Release binaries consumed by `cpm upgrade` / scoop / manual copy.

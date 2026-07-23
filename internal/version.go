@@ -17,7 +17,10 @@ var (
 	Commit  = "unknown"
 )
 
-const repoOwner = "jakubkontra"
+// repoOwner/repoName point cpm's self-update at the release source. This fork
+// (ahmednfwela) carries the Windows port + the add/fleet features, so upgrades
+// must come from here, NOT upstream jakubkontra (which would wipe them).
+const repoOwner = "ahmednfwela"
 const repoName = "claude-profile-manager"
 
 // binaryName is the on-disk cpm binary name for the current OS.
