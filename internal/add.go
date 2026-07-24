@@ -1,8 +1,10 @@
 package internal
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -112,7 +114,7 @@ func appendProfileBlock(configPath, block string) error {
 // materializes the profile dir (seed settings, link shared dirs, optional MCP
 // sync), installs the launcher, and prints the login next-step. Credentials are
 // never created — the user must `/login` once.
-func AddProfile(cfg *Config, configPath, email, alias, fromProfile string) error {
+func AddProfile(cfg *Config, configPath, email, alias, fromProfile string, loginNow bool) error {
 	if err := ValidateAlias(alias); err != nil {
 		return err
 	}
@@ -174,7 +176,46 @@ func AddProfile(cfg *Config, configPath, email, alias, fromProfile string) error
 		return fmt.Errorf("wrapper: %w", err)
 	}
 
-	fmt.Printf("\nProfile %q ready. One manual step remains:\n", alias)
-	fmt.Printf("  claude-%s        # then /login as %s\n", alias, email)
+	fmt.Printf("\nProfile %q ready.\n", alias)
+	if loginNow {
+		fmt.Printf("Signing in to %s — a browser window will open...\n", email)
+		if err := runProfileLogin(cpmPath, alias, email); err != nil {
+			fmt.Printf("  sign-in didn't complete (%v)\n", err)
+			fmt.Printf("  finish later: claude-%s auth login --email %s\n", alias, email)
+		} else if acct, ok := profileAuthStatus(cpmPath, alias); ok {
+			fmt.Printf("  signed in as %s\n", acct)
+		} else {
+			fmt.Printf("  sign-in launched; verify with: claude-%s auth status\n", alias)
+		}
+	} else {
+		fmt.Printf("  Sign in:  claude-%s auth login --email %s   (or launch claude-%s and /login)\n", alias, email, alias)
+	}
 	return nil
+}
+
+// runProfileLogin runs `cpm run <alias> auth login --email <email>` with inherited
+// stdio so the interactive OAuth sign-in works; `cpm run` applies the profile's
+// isolated CLAUDE_CONFIG_DIR + env. `auth` is in cpm's run-bypass list, so no
+// --dangerously-skip-permissions is injected into the auth subcommand.
+func runProfileLogin(cpmPath, alias, email string) error {
+	cmd := exec.Command(cpmPath, "run", alias, "auth", "login", "--email", email)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return cmd.Run()
+}
+
+// profileAuthStatus returns the signed-in account email for a profile, if the
+// profile is authenticated (via `claude auth status --json`).
+func profileAuthStatus(cpmPath, alias string) (string, bool) {
+	out, err := exec.Command(cpmPath, "run", alias, "auth", "status", "--json").Output()
+	if err != nil {
+		return "", false
+	}
+	var s struct {
+		LoggedIn bool   `json:"loggedIn"`
+		Email    string `json:"email"`
+	}
+	if json.Unmarshal(out, &s) != nil || !s.LoggedIn {
+		return "", false
+	}
+	return s.Email, true
 }

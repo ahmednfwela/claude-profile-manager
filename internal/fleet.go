@@ -163,12 +163,12 @@ func remoteAddProfile(peer *FleetPeer, email, alias string) (string, error) {
 // AddProfileToFleet adds the account locally, then propagates it to every
 // reachable peer by invoking the peer's own `cpm add` over SSH. It prints a
 // login matrix at the end (credentials are never transported).
-func AddProfileToFleet(cfg *Config, configPath, email, alias, fromProfile string) error {
+func AddProfileToFleet(cfg *Config, configPath, email, alias, fromProfile string, loginNow bool) error {
 	f, err := fleetConfigured(cfg)
 	if err != nil {
 		return err
 	}
-	if err := AddProfile(cfg, configPath, email, alias, fromProfile); err != nil {
+	if err := AddProfile(cfg, configPath, email, alias, fromProfile, loginNow); err != nil {
 		return fmt.Errorf("local add: %w", err)
 	}
 
@@ -257,7 +257,7 @@ func FleetSync(cfg *Config, configPath string) error {
 			continue
 		}
 		fmt.Printf("\n[local] adding missing profile %q (%s)\n", alias, union[alias])
-		if err := AddProfile(cfg, configPath, union[alias], alias, ""); err != nil {
+		if err := AddProfile(cfg, configPath, union[alias], alias, "", false); err != nil {
 			fmt.Printf("  FAILED: %v\n", err)
 		} else {
 			changed = true

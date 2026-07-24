@@ -723,6 +723,7 @@ func cloudRemoteCmd() *cobra.Command {
 func addCmd() *cobra.Command {
 	var from string
 	var fleet bool
+	var login bool
 
 	cmd := &cobra.Command{
 		Use:   "add <email> <alias>",
@@ -730,8 +731,10 @@ func addCmd() *cobra.Command {
 		Long: "Add a new Claude account as an isolated profile.\n\n" +
 			"Clones args/env from a Max template (fleet.default_template, or the first\n" +
 			"Max profile, or --from), appends [profiles.<alias>] to config.toml, sets up\n" +
-			"the profile dir + launcher, and prints the /login step. Credentials are\n" +
-			"never created. With --fleet, the account is also added on every peer.",
+			"the profile dir + launcher, then runs 'claude auth login --email <email>'\n" +
+			"(interactive TTY only; --login=false or --fleet/SSH just prints it) and\n" +
+			"verifies via 'claude auth status'. Credentials are never copied.\n" +
+			"With --fleet, the account is also added on every peer.",
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			email, alias := args[0], args[1]
@@ -739,16 +742,26 @@ func addCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			loginNow := login && isInteractiveTTY()
 			if fleet {
-				return internal.AddProfileToFleet(cfg, configPath, email, alias, from)
+				return internal.AddProfileToFleet(cfg, configPath, email, alias, from, loginNow)
 			}
-			return internal.AddProfile(cfg, configPath, email, alias, from)
+			return internal.AddProfile(cfg, configPath, email, alias, from, loginNow)
 		},
 	}
 
 	cmd.Flags().StringVar(&from, "from", "", "template profile to clone args/env from (default: fleet.default_template or first Max profile)")
 	cmd.Flags().BoolVar(&fleet, "fleet", false, "also add this account on every configured fleet peer over SSH")
+	cmd.Flags().BoolVar(&login, "login", true, "run 'claude auth login' after add when stdin is a TTY (--login=false to skip; auto-skipped under --fleet/SSH)")
 	return cmd
+}
+
+// isInteractiveTTY reports whether stdin is a terminal, so an interactive browser
+// sign-in can run. False under --fleet/SSH/CI, where the add flow prints the
+// sign-in command instead of launching it.
+func isInteractiveTTY() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
 }
 
 func fleetCmd() *cobra.Command {
