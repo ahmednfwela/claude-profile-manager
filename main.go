@@ -53,6 +53,7 @@ func main() {
 	root.AddCommand(cloudCmd())
 	root.AddCommand(addCmd())
 	root.AddCommand(fleetCmd())
+	root.AddCommand(channelCmd())
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
@@ -773,6 +774,73 @@ func fleetCmd() *cobra.Command {
 	cmd.AddCommand(fleetStatusCmd())
 	cmd.AddCommand(fleetSyncCmd())
 	return cmd
+}
+
+func channelCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "channel",
+		Short: "Message a running Claude session by profile alias",
+		Long: "A Claude Code channel is an MCP server the session spawns, listening on a\n" +
+			"local port; messaging a session is an HTTP POST to that port. Each profile\n" +
+			"gets one stable port DERIVED from config (never stored), so any process that\n" +
+			"reads the same config can reach any session -- including across accounts.\n\n" +
+			"The target session must be running with its channel loaded; a channel does\n" +
+			"not exist while the session is down, and a message sent then is lost.",
+	}
+	cmd.AddCommand(channelSendCmd())
+	cmd.AddCommand(channelStatusCmd())
+	return cmd
+}
+
+func channelSendCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "send <alias> <message>",
+		Short: "Push a message into the named profile's running session",
+		Args:  cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := internal.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+			alias := args[0]
+			msg := strings.Join(args[1:], " ")
+			if err := internal.SendToProfile(cfg, alias, msg); err != nil {
+				return err
+			}
+			port, _ := internal.ChannelPort(cfg, alias)
+			fmt.Printf("sent to %s (127.0.0.1:%d)\n", alias, port)
+			return nil
+		},
+	}
+}
+
+func channelStatusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Show each profile's channel port and whether anything is bound",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := internal.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+			states := internal.ChannelStatus(cfg)
+			if len(states) == 0 {
+				fmt.Println("no profiles configured")
+				return nil
+			}
+			for _, s := range states {
+				mark := "-"
+				note := "no session listening"
+				if s.Listening {
+					mark = "*"
+					note = "listening"
+				}
+				fmt.Printf("  %s %-10s %d  %s\n", mark, s.Alias, s.Port, note)
+			}
+			fmt.Println("\nA port bound with no session running is an orphaned channel subprocess.")
+			return nil
+		},
+	}
 }
 
 func fleetStatusCmd() *cobra.Command {
