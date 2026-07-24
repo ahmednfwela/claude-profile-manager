@@ -1,0 +1,14 @@
+{
+  "name": "cpm-channel",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "cpm channel server — HTTP-transport Claude Code channel; one server per profile serves every session of that profile.",
+  "main": "httpchan.mjs",
+  "scripts": {
+    "start": "node httpchan.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  }
+}

@@ -22,6 +22,10 @@ type Profile struct {
 	Args        []string          `toml:"args"`
 	Env         map[string]string `toml:"env"`
 	Attribution *Attribution      `toml:"attribution"`
+	// ChannelPort pins this profile's channel endpoint instead of deriving it.
+	// Set it when a listening session must survive a roster change (adding a
+	// profile that sorts earlier shifts every derived port after it).
+	ChannelPort int `toml:"channel_port"`
 }
 
 type CloudConfig struct {
@@ -71,6 +75,9 @@ type Config struct {
 	Profiles  map[string]*Profile `toml:"profiles"`
 	Cloud     *CloudConfig        `toml:"cloud"`
 	Fleet     *FleetConfig        `toml:"fleet"`
+	// ChannelBasePort is the first port of the per-profile channel range
+	// (default DefaultChannelBasePort). Ports are derived from it, never stored.
+	ChannelBasePort int `toml:"channel_base_port"`
 }
 
 // ManageMCPEnabled reports whether cpm should sync MCP servers into profiles.
