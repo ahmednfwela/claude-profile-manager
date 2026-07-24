@@ -142,19 +142,48 @@ func ChannelPort(cfg *Config, alias string) (int, error) {
 	if prof != nil && prof.ChannelPort > 0 {
 		return prof.ChannelPort, nil
 	}
-	base := channelBasePort(cfg)
-	pinned := explicitPorts(cfg)
-	for i, a := range sortedAliases(cfg) {
-		if a != alias {
+	port, ok := channelAllocation(cfg)[alias]
+	if !ok {
+		return 0, fmt.Errorf("unknown profile %q", alias)
+	}
+	return port, nil
+}
+
+// channelAllocation assigns every profile its endpoint in one pass.
+//
+// Computing a port from an alias's INDEX alone is unsafe: stepping over a pinned
+// port pushes that alias onto the NEXT alias's natural slot, and the next alias
+// does not step, so two profiles collide. A review sweep found 40 of 90 realistic
+// rosters colliding that way (44%) -- and the collision is persistent, because
+// ChannelInstall writes the same URL into both profiles.
+//
+// So allocation is whole-roster: pinned ports are claimed first, then each
+// remaining alias in sorted order takes the next port that is neither pinned nor
+// already handed out. Deterministic (sorted input, no map iteration) and
+// collision-free by construction.
+func channelAllocation(cfg *Config) map[string]int {
+	alloc := make(map[string]int, len(cfg.Profiles))
+	taken := map[int]bool{}
+	aliases := sortedAliases(cfg)
+
+	for _, a := range aliases {
+		if p := cfg.Profiles[a]; p != nil && p.ChannelPort > 0 {
+			alloc[a] = p.ChannelPort
+			taken[p.ChannelPort] = true
+		}
+	}
+	next := channelBasePort(cfg)
+	for _, a := range aliases {
+		if _, done := alloc[a]; done {
 			continue
 		}
-		port := base + i
-		for pinned[port] {
-			port++
+		for taken[next] {
+			next++
 		}
-		return port, nil
+		alloc[a] = next
+		taken[next] = true
 	}
-	return 0, fmt.Errorf("unknown profile %q", alias)
+	return alloc
 }
 
 // SendToProfile POSTs a message to a profile's channel endpoint — the wire form
@@ -223,25 +252,34 @@ func ChannelStatus(cfg *Config) []ChannelState {
 	return out
 }
 
-// ChannelServerScript locates the bundled channel server. It sits next to the cpm
-// binary in a release, and next to the source tree in development, so both work
-// without configuration.
+// ChannelServerScript locates the channel server, preferring the SELF-CONTAINED
+// bundle (httpchan.bundle.mjs, SDK inlined by `make channel-bundle`). The bundle is
+// what ships in a release, because the release archive carries no node_modules -- an
+// un-bundled httpchan.mjs there dies with ERR_MODULE_NOT_FOUND. The plain source is
+// accepted too, for a dev checkout that has run `npm install` in channel/.
 func ChannelServerScript() (string, error) {
-	candidates := []string{}
+	// Bundle first at every root: a root that has both must use the one with no
+	// runtime dependency.
+	roots := []string{}
 	if exe, err := os.Executable(); err == nil {
 		dir := filepath.Dir(exe)
-		candidates = append(candidates,
-			filepath.Join(dir, "channel", "httpchan.mjs"),
-			filepath.Join(dir, "..", "channel", "httpchan.mjs"),
-		)
+		roots = append(roots, dir, filepath.Join(dir, ".."))
 	}
 	if wd, err := os.Getwd(); err == nil {
-		candidates = append(candidates, filepath.Join(wd, "channel", "httpchan.mjs"))
+		roots = append(roots, wd)
+	}
+	candidates := []string{}
+	for _, name := range []string{"httpchan.bundle.mjs", "httpchan.mjs"} {
+		for _, r := range roots {
+			candidates = append(candidates, filepath.Join(r, "channel", name))
+		}
 	}
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {
 			return c, nil
 		}
 	}
-	return "", fmt.Errorf("channel server not found; looked in: %s", strings.Join(candidates, ", "))
+	return "", fmt.Errorf("channel server not found; looked in: %s | build it with: "+
+		"cd channel && npm install && bun build httpchan.mjs --target=node --outfile=httpchan.bundle.mjs",
+		strings.Join(candidates, ", "))
 }

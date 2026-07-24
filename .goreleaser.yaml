@@ -20,7 +20,11 @@ builds:
       - -X github.com/jakubkontra/cpm/internal.Commit={{.ShortCommit}}
 
 archives:
-  - format: binary
+  # `cpm channel serve` execs this; it must ship WITH the binary. The bundle has the
+  # MCP SDK inlined, so a release needs no node_modules.
+  - files:
+      - channel/httpchan.bundle.mjs
+    format: binary
     name_template: 'cpm_{{ .Os }}_{{ .Arch }}{{ if eq .Os "windows" }}.exe{{ end }}'
 
 checksum:

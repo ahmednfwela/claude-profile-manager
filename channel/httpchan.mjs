@@ -28,7 +28,38 @@ import { randomUUID } from 'node:crypto'
 
 const PORT = Number(process.env.PORT || process.env.CHANNEL_PORT || 8790)
 const NAME = process.env.CHANNEL_NAME || 'cpm-channel'
-const HOST = '127.0.0.1' // loopback only: an ungated channel is a prompt-injection vector
+
+// Loopback bind stops REMOTE network peers. It does NOT stop the user's own browser,
+// which is the realistic attacker: a cross-origin `POST` with `Content-Type: text/plain`
+// is a CORS "simple request", so the browser SENDS it without preflight and the side
+// effects happen -- only the response is withheld from the page (MDN, Cross-Origin
+// Resource Sharing). The port is enumerable (base + roster index), and this server's
+// own instructions tell the agent to carry out whatever arrives. So any page the user
+// visits could inject instructions into every live session.
+//
+// Proven live in review: a `POST /push` with `Origin: https://evil.example` was
+// delivered verbatim to 3 sessions. The gate below closes that.
+const HOST = '127.0.0.1'
+
+// A browser ALWAYS attaches Origin to a cross-origin request; a local CLI client
+// (curl, cpm, the Claude Code MCP client) never does. So "has an Origin header" is a
+// precise, zero-config discriminator for browser-originated traffic. Same-origin
+// fetches from a page served by this server are impossible -- it serves no HTML.
+const rejectBrowserOrigin = (req, res) => {
+  const origin = req.headers.origin
+  if (origin === undefined) return false
+  res.writeHead(403, { 'Content-Type': 'application/json' })
+  res.end(
+    JSON.stringify({
+      error: 'forbidden',
+      reason:
+        'Request carried an Origin header, so it came from a web page. This channel injects ' +
+        'instructions into a running agent and accepts local clients only.',
+    }) + '\n',
+  )
+  process.stderr.write(`[cpm-channel] BLOCKED cross-origin ${req.method} ${req.url} from ${origin}\n`)
+  return true
+}
 
 /** @type {Map<string, {server: Server, transport: WebStandardStreamableHTTPServerTransport}>} */
 const sessions = new Map()
@@ -94,6 +125,7 @@ const json = (res, code, obj) => {
 }
 
 createServer(async (req, res) => {
+  if (rejectBrowserOrigin(req, res)) return
   const path = (req.url || '/').split('?')[0]
   const raw = req.method === 'POST' ? await readBody(req) : ''
 
@@ -111,6 +143,11 @@ createServer(async (req, res) => {
       let server
       const transport = new WebStandardStreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
+        // Ships OFF by default in the SDK. On, it rejects a Host/Origin that is not
+        // ours -- defence in depth against DNS rebinding, which would otherwise let a
+        // hostile page reach loopback under an allowed name.
+        enableDnsRebindingProtection: true,
+        allowedHosts: [`127.0.0.1:${PORT}`, `localhost:${PORT}`],
         onsessioninitialized: (newSid) => sessions.set(newSid, { server, transport }),
         onsessionclosed: (closedSid) => sessions.delete(closedSid),
       })

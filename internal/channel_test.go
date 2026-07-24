@@ -302,3 +302,59 @@ func TestSendToProfileSucceedsWhenASessionReceived(t *testing.T) {
 		t.Fatalf("a delivered push must succeed: %v", err)
 	}
 }
+
+// F2 regression (PR #9 review): a PINNED port inside the derived band pushes one
+// alias's derived port onto the NEXT alias's natural slot, and that alias does not
+// step. Result: two profiles resolve to ONE endpoint and a message for one executes
+// in the other's session -- across accounts, and persistently, because
+// ChannelInstall writes the colliding URL into both profiles' .claude.json.
+//
+// The original TestChannelPortNoCollisions missed this because cfgWith() never pins
+// anything, so it only exercised the all-derived path where collisions are
+// impossible by construction -- a confounded fixture, not a guard.
+func TestChannelPortNoCollisionsWithPinnedPorts(t *testing.T) {
+	cfg := cfgWith("bdaya", "digrum1", "glm")
+	cfg.Profiles["bdaya"].ChannelPort = 8791 // operator pins because 8790 is taken
+
+	seen := map[int]string{}
+	for _, a := range []string{"bdaya", "digrum1", "glm"} {
+		p, err := ChannelPort(cfg, a)
+		if err != nil {
+			t.Fatalf("ChannelPort(%s): %v", a, err)
+		}
+		if other, dup := seen[p]; dup {
+			t.Fatalf("COLLISION: %q and %q both resolve to %d — a send for one lands in the other's session", other, a, p)
+		}
+		seen[p] = a
+	}
+}
+
+// Breadth: every roster size x every pin position x every pin port in the band.
+// The review's sweep found 40 of 90 configurations colliding (44%).
+func TestChannelPortNoCollisionsExhaustive(t *testing.T) {
+	base := DefaultChannelBasePort
+	for size := 2; size <= 6; size++ {
+		aliases := make([]string, size)
+		for i := range aliases {
+			aliases[i] = fmt.Sprintf("p%02d", i)
+		}
+		for pinIdx := 0; pinIdx < size; pinIdx++ {
+			for off := 0; off < size; off++ {
+				cfg := cfgWith(aliases...)
+				cfg.Profiles[aliases[pinIdx]].ChannelPort = base + off
+				seen := map[int]string{}
+				for _, a := range aliases {
+					p, err := ChannelPort(cfg, a)
+					if err != nil {
+						t.Fatalf("size=%d pin=%s@%d: %v", size, aliases[pinIdx], base+off, err)
+					}
+					if other, dup := seen[p]; dup {
+						t.Fatalf("size=%d pin=%s@%d -> %q and %q both got %d",
+							size, aliases[pinIdx], base+off, other, a, p)
+					}
+					seen[p] = a
+				}
+			}
+		}
+	}
+}
