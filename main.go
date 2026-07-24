@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os/exec"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -789,7 +790,67 @@ func channelCmd() *cobra.Command {
 	}
 	cmd.AddCommand(channelSendCmd())
 	cmd.AddCommand(channelStatusCmd())
+	cmd.AddCommand(channelInstallCmd())
+	cmd.AddCommand(channelServeCmd())
 	return cmd
+}
+
+func channelInstallCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "install <alias>",
+		Short: "Register the channel in a profile so its sessions can receive messages",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := internal.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+			alias := args[0]
+			base := internal.ProfilesBaseDir(configPath)
+			if err := internal.ChannelInstall(cfg, base, alias); err != nil {
+				return err
+			}
+			port, _ := internal.ChannelPort(cfg, alias)
+			fmt.Printf("registered %q in profile %s (http://127.0.0.1:%d/mcp)\n",
+				internal.ChannelServerName, alias, port)
+			fmt.Printf("\nStart the server:  cpm channel serve %s\n", alias)
+			fmt.Printf("Then launch a session with the channel loaded:\n")
+			fmt.Printf("  claude-%s --dangerously-load-development-channels server:%s\n",
+				alias, internal.ChannelServerName)
+			return nil
+		},
+	}
+}
+
+func channelServeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "serve <alias>",
+		Short: "Run the channel server for a profile on its derived port",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := internal.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+			alias := args[0]
+			port, err := internal.ChannelPort(cfg, alias)
+			if err != nil {
+				return err
+			}
+			script, err := internal.ChannelServerScript()
+			if err != nil {
+				return err
+			}
+			fmt.Printf("starting channel %q for %s on 127.0.0.1:%d\n", internal.ChannelServerName, alias, port)
+			c := exec.Command("node", script)
+			c.Env = append(os.Environ(),
+				fmt.Sprintf("PORT=%d", port),
+				fmt.Sprintf("CHANNEL_NAME=%s", internal.ChannelServerName),
+			)
+			c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+			return c.Run()
+		},
+	}
 }
 
 func channelSendCmd() *cobra.Command {
