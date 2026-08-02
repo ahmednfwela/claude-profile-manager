@@ -34,7 +34,6 @@ const (
 	// incident. Slugs are never computed by cpm; both are found by globbing for
 	// the id-named transcript.
 	cliNewSlug = "D--projects-devops-aggregate"
-	cliCwd     = `D:\projects\devops-aggregate`
 
 	cliRunInFlight = "wf_22995661-f47" // launched, never terminated
 	cliRunDone     = "wf_bbbb2222-bbb" // launched and terminated
@@ -258,18 +257,30 @@ func originTerminal(taskID string) string {
 		`</task-id>\n<status>completed</status>\n</task-notification>"}}`
 }
 
-// handoffFixture fabricates the two-profile tree and returns (configPath, fromDir, toDir).
+// handoffFixture fabricates the two-profile tree and returns
+// (configPath, fromDir, toDir, workDir).
+//
+// workDir is a real directory: cpm chdirs the claude child into the session's
+// own project cwd, so a hard-coded path would make the whole test
+// platform-specific (`chdir D:\projects\...: no such file or directory` on
+// Linux/macOS). The project SLUGS stay hard-coded — cpm treats them as opaque
+// strings and never parses them, and keeping them fixed preserves the
+// worktree-vs-repo-root cross-slug case this test exists for.
 //
 // In production every profile junctions projects/ to one shared store, so the
 // origin transcript is visible from BOTH profiles. Junction creation needs
 // elevation on Windows, so the fixture writes the same tree into both profile
 // dirs instead; cpm only ever reads the TARGET profile's projects/, which is
 // where the transplant must land.
-func handoffFixture(t *testing.T) (string, string, string) {
+func handoffFixture(t *testing.T) (string, string, string, string) {
 	t.Helper()
 	base := t.TempDir()
 	fromDir := filepath.Join(base, "from")
 	toDir := filepath.Join(base, "to")
+	workDir := filepath.Join(base, "workdir")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	write(t, filepath.Join(base, "config.toml"), fmt.Sprintf(
 		"source_dir = %q\nbin_dir = %q\n\n[profiles.from]\ndescription = \"origin\"\n\n[profiles.to]\ndescription = \"target\"\n",
@@ -278,7 +289,7 @@ func handoffFixture(t *testing.T) (string, string, string) {
 	originSessionDir := filepath.Join(toDir, "projects", cliOriginSlug, cliOriginID)
 	transcript := strings.Join([]string{
 		`{"type":"custom-title","sessionId":"` + cliOriginID + `","cwd":null}`,
-		`{"type":"attachment","cwd":"D:\\projects\\devops-aggregate","sessionKind":"bg"}`,
+		`{"type":"attachment","cwd":"` + jsonEscape(workDir) + `","sessionKind":"bg"}`,
 		originLaunch("wtaskaaa1", cliRunInFlight, originSessionDir),
 		originLaunch("wtaskbbb2", cliRunDone, originSessionDir),
 		originTerminal("wtaskbbb2"),
@@ -307,7 +318,7 @@ func handoffFixture(t *testing.T) (string, string, string) {
 	write(t, filepath.Join(fromDir, "daemon", "roster.json"),
 		`{"proto":1,"workers":{"`+cliOriginID[:8]+`":{"sessionId":"`+cliOriginID+`"}}}`)
 
-	return filepath.Join(base, "config.toml"), fromDir, toDir
+	return filepath.Join(base, "config.toml"), fromDir, toDir, workDir
 }
 
 type stubCall struct {
@@ -336,10 +347,10 @@ func readStubLog(t *testing.T, path string) []stubCall {
 	return calls
 }
 
-func runHandoff(t *testing.T, extraEnv ...string) (out string, toDir string, log []stubCall) {
+func runHandoff(t *testing.T, extraEnv ...string) (out string, toDir string, workDir string, log []stubCall) {
 	t.Helper()
 	cpm, stubDir := buildBinaries(t)
-	configPath, _, toDir := handoffFixture(t)
+	configPath, _, toDir, workDir := handoffFixture(t)
 	logPath := filepath.Join(t.TempDir(), "stub.log")
 
 	cmd := exec.Command(cpm, "--config", configPath, "handoff", cliOriginID, "from", "to")
@@ -354,7 +365,7 @@ func runHandoff(t *testing.T, extraEnv ...string) (out string, toDir string, log
 	if err != nil {
 		t.Fatalf("cpm handoff failed: %v\n%s", err, combined)
 	}
-	return string(combined), toDir, readStubLog(t, logPath)
+	return string(combined), toDir, workDir, readStubLog(t, logPath)
 }
 
 func newRunDir(toDir, runID string) string {
@@ -371,7 +382,7 @@ func mustRead(t *testing.T, path string) string {
 }
 
 func TestHandoffCLIDispatchesResumeInSessionCwd(t *testing.T) {
-	out, _, calls := runHandoff(t)
+	out, _, workDir, calls := runHandoff(t)
 
 	if len(calls) != 2 {
 		t.Fatalf("expected a stop then a --bg re-dispatch, got %d calls:\n%s\n%s", len(calls), out, dump(calls))
@@ -386,8 +397,8 @@ func TestHandoffCLIDispatchesResumeInSessionCwd(t *testing.T) {
 			t.Fatalf("re-dispatch argv missing %q: %v", want, bg.Args)
 		}
 	}
-	if bg.Cwd != cliCwd {
-		t.Fatalf("re-dispatch cwd = %q, want the session's own project dir %q", bg.Cwd, cliCwd)
+	if bg.Cwd != workDir {
+		t.Fatalf("re-dispatch cwd = %q, want the session's own project dir %q", bg.Cwd, workDir)
 	}
 }
 
@@ -395,7 +406,7 @@ func TestHandoffCLIDispatchesResumeInSessionCwd(t *testing.T) {
 // transcripts must be sitting in the NEW session's transcript dir when the
 // resumed agent looks for them, or the whole run silently re-executes.
 func TestHandoffCLITransplantsWorkflowRuns(t *testing.T) {
-	out, toDir, _ := runHandoff(t)
+	out, toDir, _, _ := runHandoff(t)
 
 	originRun := filepath.Join(toDir, "projects", cliOriginSlug, cliOriginID, "subagents", "workflows", cliRunInFlight)
 
@@ -432,7 +443,7 @@ func TestHandoffCLITransplantsWorkflowRuns(t *testing.T) {
 // The prompt must name the run that is actually resumable, and must not tell the
 // agent to resume one that already finished.
 func TestHandoffCLIPromptNamesInFlightRun(t *testing.T) {
-	_, _, calls := runHandoff(t)
+	_, _, _, calls := runHandoff(t)
 	prompt := calls[len(calls)-1].Args[promptIndex(t, calls[len(calls)-1].Args)]
 
 	for _, want := range []string{cliRunInFlight, "resumeFromRunId"} {
@@ -452,7 +463,7 @@ func TestHandoffCLIPromptNamesInFlightRun(t *testing.T) {
 // resumed session may have started a fresh run under that id, and silently
 // overwriting it would destroy live state.
 func TestHandoffCLIRefusesToClobberExistingRunDir(t *testing.T) {
-	out, toDir, _ := runHandoff(t, "CPM_STUB_COLLIDE="+cliRunInFlight)
+	out, toDir, _, _ := runHandoff(t, "CPM_STUB_COLLIDE="+cliRunInFlight)
 
 	if got := mustRead(t, filepath.Join(newRunDir(toDir, cliRunInFlight), "journal.jsonl")); got != "FRESH-RUN\n" {
 		t.Fatalf("existing destination run dir was clobbered: %q", got)
