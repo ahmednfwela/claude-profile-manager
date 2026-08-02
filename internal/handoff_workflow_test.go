@@ -40,42 +40,55 @@ func writeTranscript(t *testing.T, lines ...string) string {
 	return path
 }
 
-func TestDetectInFlightWorkflow(t *testing.T) {
+// A session can have several Workflows running at once, so detection returns
+// every in-flight launch, oldest first — an earlier "newest launch only" form
+// silently dropped the others from the resume instruction.
+func TestDetectInFlightWorkflows(t *testing.T) {
+	const (
+		runB    = "wf_bbbb2222-bbb"
+		scriptB = `C:\store\projects\D--proj\11111111-1111-1111-1111-111111111111\workflows\scripts\lane-b-wf_bbbb2222-bbb.js`
+	)
+
 	cases := []struct {
-		name       string
-		lines      []string
-		wantRunID  string // "" means: want nil (no in-flight workflow)
-		wantScript string
+		name  string
+		lines []string
+		want  []string // runIDs, in the order returned
 	}{
 		{
-			name:       "in-flight launch is detected with runId and scriptPath",
-			lines:      []string{plainLine, launchA, plainLine},
-			wantRunID:  wfFixtureRunA,
-			wantScript: wfFixtureScriptA,
+			name:  "two simultaneously in-flight launches are both returned, oldest first",
+			lines: []string{launchA, launchB},
+			want:  []string{wfFixtureRunA, runB},
+		},
+		{
+			name:  "a completed launch is filtered out, the in-flight one survives",
+			lines: []string{launchA, launchB, terminalB},
+			want:  []string{wfFixtureRunA},
+		},
+		{
+			name:  "all completed yields nothing",
+			lines: []string{launchA, terminalA, launchB, terminalB},
+		},
+		{
+			name:  "a completed workflow is not resumed",
+			lines: []string{plainLine, launchA, plainLine, terminalA},
+		},
+		{
+			name:  "a queue-operation notification also counts as terminal",
+			lines: []string{launchB, terminalB},
+		},
+		{
+			name:  "a terminal signal BEFORE the launch does not close it",
+			lines: []string{terminalA, launchA},
+			want:  []string{wfFixtureRunA},
+		},
+		{
+			name:  "a lone in-flight launch is returned with its coordinates",
+			lines: []string{plainLine, launchA, plainLine},
+			want:  []string{wfFixtureRunA},
 		},
 		{
 			name:  "no workflow in transcript",
 			lines: []string{plainLine, plainLine},
-		},
-		{
-			name:  "completed workflow is not resumed",
-			lines: []string{plainLine, launchA, plainLine, terminalA},
-		},
-		{
-			name:  "queue-operation notification also counts as terminal",
-			lines: []string{launchB, terminalB},
-		},
-		{
-			name:       "latest completed but earlier still in flight resumes the earlier one",
-			lines:      []string{launchA, launchB, terminalB},
-			wantRunID:  wfFixtureRunA,
-			wantScript: wfFixtureScriptA,
-		},
-		{
-			name:       "most recent launch wins when several are in flight",
-			lines:      []string{launchA, launchB},
-			wantRunID:  "wf_bbbb2222-bbb",
-			wantScript: `C:\store\projects\D--proj\11111111-1111-1111-1111-111111111111\workflows\scripts\lane-b-wf_bbbb2222-bbb.js`,
 		},
 		{
 			name:  "quoted launch text without coordinates is ignored",
@@ -85,56 +98,58 @@ func TestDetectInFlightWorkflow(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := detectInFlightWorkflow(writeTranscript(t, tc.lines...))
-			if tc.wantRunID == "" {
-				if got != nil {
-					t.Fatalf("expected no in-flight workflow, got %+v", got)
+			got := detectInFlightWorkflows(writeTranscript(t, tc.lines...))
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %d in-flight workflows, want %d: %+v", len(got), len(tc.want), got)
+			}
+			for i, want := range tc.want {
+				if got[i].runID != want {
+					t.Fatalf("run %d = %q, want %q", i, got[i].runID, want)
 				}
-				return
-			}
-			if got == nil {
-				t.Fatalf("expected in-flight workflow %s, got nil", tc.wantRunID)
-			}
-			if got.runID != tc.wantRunID {
-				t.Fatalf("runID = %q, want %q", got.runID, tc.wantRunID)
-			}
-			if got.scriptPath != tc.wantScript {
-				t.Fatalf("scriptPath = %q, want %q", got.scriptPath, tc.wantScript)
 			}
 		})
 	}
 
-	t.Run("unreadable transcript is best-effort nil", func(t *testing.T) {
-		if got := detectInFlightWorkflow(filepath.Join(t.TempDir(), "missing.jsonl")); got != nil {
-			t.Fatalf("expected nil for missing transcript, got %+v", got)
+	t.Run("scriptPath is carried for every launch", func(t *testing.T) {
+		got := detectInFlightWorkflows(writeTranscript(t, launchA, launchB))
+		if got[0].scriptPath != wfFixtureScriptA || got[1].scriptPath != scriptB {
+			t.Fatalf("scriptPaths not carried: %q / %q", got[0].scriptPath, got[1].scriptPath)
+		}
+	})
+
+	t.Run("unreadable transcript is best-effort empty", func(t *testing.T) {
+		if got := detectInFlightWorkflows(filepath.Join(t.TempDir(), "missing.jsonl")); len(got) != 0 {
+			t.Fatalf("expected none for a missing transcript, got %+v", got)
 		}
 	})
 }
 
-func TestAugmentPromptForWorkflow(t *testing.T) {
+func TestAugmentPromptForWorkflows(t *testing.T) {
 	const generic = "Continue the previous task from exactly where it left off. Ignore hook housekeeping notices."
 
-	t.Run("nil workflow leaves the prompt unmodified", func(t *testing.T) {
-		if got := augmentPromptForWorkflow(generic, nil); got != generic {
+	t.Run("no launches leaves the prompt unmodified", func(t *testing.T) {
+		if got := augmentPromptForWorkflows(generic, nil); got != generic {
 			t.Fatalf("prompt modified without a workflow: %q", got)
+		}
+		if got := augmentPromptForWorkflows(generic, []workflowLaunch{}); got != generic {
+			t.Fatalf("prompt modified for an empty slice: %q", got)
 		}
 	})
 
-	t.Run("in-flight workflow appends the resume instruction", func(t *testing.T) {
-		wf := detectInFlightWorkflow(writeTranscript(t, launchA))
-		if wf == nil {
-			t.Fatal("fixture launch not detected")
-		}
-		got := augmentPromptForWorkflow(generic, wf)
+	t.Run("every in-flight run is named with its resume call", func(t *testing.T) {
+		launches := detectInFlightWorkflows(writeTranscript(t, launchA, launchB))
+		got := augmentPromptForWorkflows(generic, launches)
 		if !strings.HasPrefix(got, generic) {
 			t.Fatalf("augmented prompt does not keep the original prompt as prefix: %q", got)
 		}
 		for _, want := range []string{
-			"A Workflow was in progress",
+			"2 Workflows were in progress",
 			"runId " + wfFixtureRunA,
-			"scriptPath " + wfFixtureScriptA,
+			"runId wf_bbbb2222-bbb",
 			`resumeFromRunId: "` + wfFixtureRunA + `"`,
-			"Resume it FIRST",
+			`resumeFromRunId: "wf_bbbb2222-bbb"`,
+			`scriptPath: "` + strings.ReplaceAll(wfFixtureScriptA, `\`, `\\`) + `"`,
+			"Resume them FIRST",
 		} {
 			if !strings.Contains(got, want) {
 				t.Fatalf("augmented prompt missing %q:\n%s", want, got)
@@ -142,10 +157,19 @@ func TestAugmentPromptForWorkflow(t *testing.T) {
 		}
 	})
 
-	t.Run("completed workflow yields the generic prompt", func(t *testing.T) {
-		wf := detectInFlightWorkflow(writeTranscript(t, launchA, terminalA))
-		if got := augmentPromptForWorkflow(generic, wf); got != generic {
-			t.Fatalf("prompt augmented for a completed workflow: %q", got)
+	t.Run("states cpm already copied the run dirs rather than asking for self-repair", func(t *testing.T) {
+		launches := detectInFlightWorkflows(writeTranscript(t, launchA))
+		got := augmentPromptForWorkflows(generic, launches)
+		if !strings.Contains(got, "cpm has already copied its run directory") {
+			t.Fatalf("prompt does not tell the agent the transplant already happened:\n%s", got)
+		}
+		// The fallback stays: the transplant lands after the re-dispatch, so a
+		// very fast first turn can still beat it.
+		if !strings.Contains(got, "If agents start re-running from scratch") {
+			t.Fatalf("prompt dropped the cache-miss fallback:\n%s", got)
+		}
+		if strings.Contains(got, "Resume them FIRST") {
+			t.Fatalf("singular case used plural phrasing:\n%s", got)
 		}
 	})
 }

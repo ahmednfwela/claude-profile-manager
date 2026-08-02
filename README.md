@@ -187,7 +187,20 @@ The `.claude-profile` file is automatically added to `.gitignore`.
 
 `cpm handoff <session-id> <from> <to>` stops a background session on one profile and re-dispatches its conversation on another via `claude --bg --resume` — useful when one account's usage limits are exhausted. Passing the same profile twice re-forks on the same account. Requires the profiles to share one projects store (junction/symlink `<profile>/projects` to a common directory).
 
-The re-dispatched session keeps the origin session's name (read from the source profile's `jobs/<short-id>/state.json`; `--name` overrides it, and `handoff-<short-id>` is used only when the origin has no recorded name). If the origin session had a Workflow in flight (a detached process that dies with the stop), the re-dispatch prompt is augmented with its `runId` and `scriptPath` so the resumed session resumes it via `Workflow({scriptPath, resumeFromRunId})` instead of silently dropping the run.
+The re-dispatched session keeps the origin session's name (read from the source profile's `jobs/<short-id>/state.json`; `--name` overrides it, and `handoff-<short-id>` is used only when the origin has no recorded name).
+
+### In-flight Workflow runs are transplanted
+
+A `--bg --resume` mints a **new** session id, and the Workflow tool's resume cache lives per-session at `projects/<slug>/<session-id>/subagents/workflows/<run-id>/journal.jsonl`. Left alone, the resumed session finds no journal and silently re-runs every agent that had already finished.
+
+`cpm handoff` therefore copies the run directories itself, after the re-dispatch:
+
+1. Every still-running Workflow launch in the origin transcript is detected (all of them, not just the newest) and named in the re-dispatch prompt with its `Workflow({scriptPath, resumeFromRunId})` call.
+2. The new session is identified from ground truth — the target profile's `daemon/roster.json` worker whose `dispatch.launch` is `{mode: "resume", sessionId: <origin id>}` — then its transcript is located by globbing for the id. The project **slug is never computed**: it is derived from the session's launch cwd and differs whenever the origin ran in a git worktree.
+3. Both are polled for up to 30s (only when the origin session actually has workflow runs, so ordinary handoffs pay nothing).
+4. Every `subagents/workflows/<run-id>/` directory is copied across. A run directory that already exists at the destination is **never** overwritten — it is skipped with a warning, since the resumed session may have started a fresh run under that id.
+
+If the wait times out or a copy fails, the handoff still succeeds and the prompt's closing fallback tells the resumed session how to repair the run directory itself.
 
 `scripts/claude-reset-nudger.ps1` (Windows) automates the same-account case: a scheduled task that watches each profile for rate-limit interruption flags and re-forks affected background sessions once. Copy it (and `scripts/hidden-launch.vbs`, which must sit next to it) somewhere stable and run with `-Install`:
 
