@@ -372,6 +372,15 @@ func newRunDir(toDir, runID string) string {
 	return filepath.Join(toDir, "projects", cliNewSlug, cliNewID, "subagents", "workflows", runID)
 }
 
+func realPath(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return path // not a resolvable path (or already gone) — compare as given
+	}
+	return resolved
+}
+
 func mustRead(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -397,8 +406,10 @@ func TestHandoffCLIDispatchesResumeInSessionCwd(t *testing.T) {
 			t.Fatalf("re-dispatch argv missing %q: %v", want, bg.Args)
 		}
 	}
-	if bg.Cwd != workDir {
-		t.Fatalf("re-dispatch cwd = %q, want the session's own project dir %q", bg.Cwd, workDir)
+	// Compare with symlinks resolved: on macOS t.TempDir() hands back /var/... while
+	// the child's own os.Getwd() reports the /private/var/... it resolves to.
+	if got, want := realPath(t, bg.Cwd), realPath(t, workDir); got != want {
+		t.Fatalf("re-dispatch cwd = %q, want the session's own project dir %q", got, want)
 	}
 }
 
