@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -157,45 +158,71 @@ func main() {
 }
 `
 
-// buildStubClaude compiles the stub and returns the directory to prepend to PATH.
-func buildStubClaude(t *testing.T) string {
-	t.Helper()
-	if _, err := exec.LookPath("go"); err != nil {
-		t.Skip("go toolchain not on PATH; cannot build the claude stub")
-	}
-	src := t.TempDir()
-	write(t, filepath.Join(src, "go.mod"), "module cpmstubclaude\n\ngo 1.21\n")
-	write(t, filepath.Join(src, "main.go"), stubSource)
+// Both binaries are built once per package run, not per test — four tests each
+// building cpm and the stub was by far the slowest thing in the suite.
+var (
+	buildOnce   sync.Once
+	buildDir    string // holds cpm and a bin/ dir containing the stub claude
+	buildErr    error
+	stubPathDir string
+	cpmPath     string
+)
 
-	binDir := t.TempDir()
-	name := "claude"
+func exeName(base string) string {
 	if runtime.GOOS == "windows" {
-		name = "claude.exe"
+		return base + ".exe"
 	}
-	cmd := exec.Command("go", "build", "-o", filepath.Join(binDir, name), ".")
-	cmd.Dir = src
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("build stub claude: %v\n%s", err, out)
-	}
-	return binDir
+	return base
 }
 
-// buildCPM compiles the real cpm binary under test.
-func buildCPM(t *testing.T) string {
+// buildBinaries compiles the real cpm binary under test and the stub `claude`.
+func buildBinaries(t *testing.T) (cpmBin, stubDir string) {
 	t.Helper()
 	if _, err := exec.LookPath("go"); err != nil {
-		t.Skip("go toolchain not on PATH; cannot build cpm")
+		t.Skip("go toolchain not on PATH; cannot build cpm and the claude stub")
 	}
-	name := "cpm"
-	if runtime.GOOS == "windows" {
-		name = "cpm.exe"
+	buildOnce.Do(func() {
+		buildDir, buildErr = os.MkdirTemp("", "cpm-cli-test")
+		if buildErr != nil {
+			return
+		}
+		cpmPath = filepath.Join(buildDir, exeName("cpm"))
+		if out, err := exec.Command("go", "build", "-o", cpmPath, ".").CombinedOutput(); err != nil {
+			buildErr = fmt.Errorf("build cpm: %v\n%s", err, out)
+			return
+		}
+
+		src := filepath.Join(buildDir, "stubsrc")
+		stubPathDir = filepath.Join(buildDir, "bin")
+		for _, d := range []string{src, stubPathDir} {
+			if buildErr = os.MkdirAll(d, 0o755); buildErr != nil {
+				return
+			}
+		}
+		if buildErr = os.WriteFile(filepath.Join(src, "go.mod"), []byte("module cpmstubclaude\n\ngo 1.21\n"), 0o644); buildErr != nil {
+			return
+		}
+		if buildErr = os.WriteFile(filepath.Join(src, "main.go"), []byte(stubSource), 0o644); buildErr != nil {
+			return
+		}
+		cmd := exec.Command("go", "build", "-o", filepath.Join(stubPathDir, exeName("claude")), ".")
+		cmd.Dir = src
+		if out, err := cmd.CombinedOutput(); err != nil {
+			buildErr = fmt.Errorf("build stub claude: %v\n%s", err, out)
+		}
+	})
+	if buildErr != nil {
+		t.Fatal(buildErr)
 	}
-	bin := filepath.Join(t.TempDir(), name)
-	cmd := exec.Command("go", "build", "-o", bin, ".")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("build cpm: %v\n%s", err, out)
+	return cpmPath, stubPathDir
+}
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if buildDir != "" {
+		os.RemoveAll(buildDir)
 	}
-	return bin
+	os.Exit(code)
 }
 
 func write(t *testing.T, path, content string) {
@@ -311,8 +338,7 @@ func readStubLog(t *testing.T, path string) []stubCall {
 
 func runHandoff(t *testing.T, extraEnv ...string) (out string, toDir string, log []stubCall) {
 	t.Helper()
-	cpm := buildCPM(t)
-	stubDir := buildStubClaude(t)
+	cpm, stubDir := buildBinaries(t)
 	configPath, _, toDir := handoffFixture(t)
 	logPath := filepath.Join(t.TempDir(), "stub.log")
 
