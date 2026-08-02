@@ -2,8 +2,10 @@ package internal
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -53,6 +55,32 @@ func readFile(t *testing.T, path string) string {
 	return string(data)
 }
 
+// captureStderr redirects os.Stderr for the duration of fn and returns
+// everything written to it. transplantWorkflowRuns reports collisions via a
+// direct fmt.Fprintf(os.Stderr, ...) rather than a return value, so this is
+// the only way to assert the warning text from this package.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close pipe writer: %v", err)
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read captured stderr: %v", err)
+	}
+	return string(data)
+}
+
 func TestTransplantWorkflowRuns(t *testing.T) {
 	t.Run("every run dir lands byte-for-byte", func(t *testing.T) {
 		base := t.TempDir()
@@ -90,7 +118,11 @@ func TestTransplantWorkflowRuns(t *testing.T) {
 		live := filepath.Join(newDir, "subagents", "workflows", "wf_collide-111", "journal.jsonl")
 		writeFile(t, live, "LIVE-RUN-DO-NOT-TOUCH\n")
 
-		runs, err := transplantWorkflowRuns(oldDir, newDir)
+		var runs []copiedWorkflowRun
+		var err error
+		stderr := captureStderr(t, func() {
+			runs, err = transplantWorkflowRuns(oldDir, newDir)
+		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -103,6 +135,12 @@ func TestTransplantWorkflowRuns(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(newDir, "subagents", "workflows", "wf_fresh-2222", "journal.jsonl")); err != nil {
 			t.Fatalf("non-colliding run did not land: %v", err)
+		}
+		// The collision must be reported, naming the run and the path — silence
+		// here is how a live resume loses a run's cache without anyone noticing.
+		wantWarning := "workflow run wf_collide-111 already exists at"
+		if !strings.Contains(stderr, wantWarning) {
+			t.Fatalf("collision was silent — expected stderr to contain %q, got %q", wantWarning, stderr)
 		}
 	})
 

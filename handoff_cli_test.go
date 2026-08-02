@@ -479,8 +479,13 @@ func TestHandoffCLIRefusesToClobberExistingRunDir(t *testing.T) {
 	if got := mustRead(t, filepath.Join(newRunDir(toDir, cliRunInFlight), "journal.jsonl")); got != "FRESH-RUN\n" {
 		t.Fatalf("existing destination run dir was clobbered: %q", got)
 	}
-	if !strings.Contains(out, cliRunInFlight) || !strings.Contains(strings.ToLower(out), "exist") {
-		t.Fatalf("collision was silent — expected a warning naming %s:\n%s", cliRunInFlight, out)
+	// Assert the load-bearing sentence, not just "exist" — t.TempDir() embeds
+	// this test's own name ("...RefusesToClobberExisting...") in every fixture
+	// path, so a bare "exist" substring match is satisfied by the temp-dir path
+	// alone and stays green even with the warning deleted entirely.
+	wantWarning := "workflow run " + cliRunInFlight + " already exists at"
+	if !strings.Contains(out, wantWarning) {
+		t.Fatalf("collision was silent — expected a warning containing %q:\n%s", wantWarning, out)
 	}
 	// The non-colliding run still lands.
 	if _, err := os.Stat(filepath.Join(newRunDir(toDir, cliRunDone), "journal.jsonl")); err != nil {
