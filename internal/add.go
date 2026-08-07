@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 var aliasRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
@@ -92,10 +93,88 @@ func RenderProfileBlock(alias, email, description string, args []string, model s
 	return b.String()
 }
 
+// staleConfigLockAge is how long a config.toml.lock sidecar file may sit
+// unmodified before appendProfileBlock treats it as abandoned (left behind by
+// a process that crashed or was killed while holding it) and reaps it, so a
+// single hard kill can never wedge every future `cpm add` shut.
+const staleConfigLockAge = 30 * time.Second
+
+// acquireConfigLock takes a simple, cross-platform mutual-exclusion lock on
+// config.toml via O_CREATE|O_EXCL on a `<config>.lock` sidecar file, so two
+// concurrent `cpm add` invocations (e.g. a local add racing a fleet peer's
+// add over SSH — see AddProfileToFleet) can no longer both read the
+// pre-append file and race a write, silently discarding one another's
+// appended block. Call the returned release func (always, via defer) to drop
+// the lock.
+func acquireConfigLock(configPath string) (release func(), err error) {
+	lockPath := ExpandPath(configPath) + ".lock"
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			f.Close()
+			return func() { os.Remove(lockPath) }, nil
+		}
+		if !os.IsExist(err) {
+			return nil, fmt.Errorf("cannot create config lock: %w", err)
+		}
+		if info, statErr := os.Stat(lockPath); statErr == nil && time.Since(info.ModTime()) > staleConfigLockAge {
+			os.Remove(lockPath) // orphaned by a crashed/killed process; reap and retry immediately
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for config lock %s (another `cpm add` running?)", lockPath)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// writeFileAtomic writes data to a temp file in the same directory as path,
+// then renames it into place. The rename is atomic on both POSIX and Windows
+// (same mechanism used by the self-update in version.go), so a crash or a
+// killed process between the write and the rename can never leave path
+// truncated/partially written — it is always either its full previous
+// content or its full new content, never anything in between.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".cpm-config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("cannot create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("cannot write temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("cannot write temp file: %w", err)
+	}
+	if err := os.Chmod(tmpPath, perm); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("cannot set permissions: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("cannot replace config: %w", err)
+	}
+	return nil
+}
+
 // appendProfileBlock appends a rendered profile block to the config file,
 // preserving all existing comments/formatting (BurntSushi/toml does not
-// round-trip comments, so we never re-serialize the whole file).
+// round-trip comments, so we never re-serialize the whole file). The
+// read-modify-write is guarded by acquireConfigLock and written via
+// writeFileAtomic so neither a crash mid-write nor a concurrent `cpm add` can
+// truncate/corrupt config.toml or silently lose another process's append.
 func appendProfileBlock(configPath, block string) error {
+	release, err := acquireConfigLock(configPath)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	p := ExpandPath(configPath)
 	data, err := os.ReadFile(p)
 	if err != nil {
@@ -106,7 +185,7 @@ func appendProfileBlock(configPath, block string) error {
 		content += "\n"
 	}
 	content += block
-	return os.WriteFile(p, []byte(content), 0o644)
+	return writeFileAtomic(p, []byte(content), 0o644)
 }
 
 // AddProfile adds a new account profile locally: it validates inputs, clones the
@@ -179,10 +258,10 @@ func AddProfile(cfg *Config, configPath, email, alias, fromProfile string, login
 	fmt.Printf("\nProfile %q ready.\n", alias)
 	if loginNow {
 		fmt.Printf("Signing in to %s — a browser window will open...\n", email)
-		if err := runProfileLogin(cpmPath, alias, email); err != nil {
+		if err := runProfileLogin(alias, profileDir, profile, email); err != nil {
 			fmt.Printf("  sign-in didn't complete (%v)\n", err)
 			fmt.Printf("  finish later: claude-%s auth login --email %s\n", alias, email)
-		} else if acct, ok := profileAuthStatus(cpmPath, alias); ok {
+		} else if acct, ok := profileAuthStatus(alias, profileDir, profile); ok {
 			fmt.Printf("  signed in as %s\n", acct)
 		} else {
 			fmt.Printf("  sign-in launched; verify with: claude-%s auth status\n", alias)
@@ -193,20 +272,49 @@ func AddProfile(cfg *Config, configPath, email, alias, fromProfile string, login
 	return nil
 }
 
-// runProfileLogin runs `cpm run <alias> auth login --email <email>` with inherited
-// stdio so the interactive OAuth sign-in works; `cpm run` applies the profile's
-// isolated CLAUDE_CONFIG_DIR + env. `auth` is in cpm's run-bypass list, so no
-// --dangerously-skip-permissions is injected into the auth subcommand.
-func runProfileLogin(cpmPath, alias, email string) error {
-	cmd := exec.Command(cpmPath, "run", alias, "auth", "login", "--email", email)
+// runProfileLogin runs `claude auth login --email <email>` directly under the
+// profile's isolated environment, with inherited stdio so the interactive
+// OAuth sign-in works.
+//
+// It builds the invocation via BuildRunInvocation — the exact same plumbing
+// `cpm run` and the generated launchers use — instead of shelling out to a
+// nested `cpm run <alias> auth login` subprocess. A nested `cpm run` cannot be
+// steered with a forwarded --config: `run` sets cobra's DisableFlagParsing,
+// and cobra's ParseFlags is an unconditional no-op whenever DisableFlagParsing
+// is set (spf13/cobra command.go), regardless of whether --config is placed
+// before or after `run` on the child's argv — verified live, both placements
+// left the child resolving internal.DefaultConfigPath(), i.e. the REAL
+// ~/.claude-profiles/config.toml, ignoring whatever --config the parent `cpm
+// add` was actually invoked with. Calling BuildRunInvocation in-process with
+// the alias/profileDir/profile the parent already resolved from its own
+// --config removes that second, unsteerable config resolution entirely.
+//
+// `auth` is in runBypass (exec_run.go), so BuildRunInvocation returns the
+// argv undecorated — no --add-dir/--model/--dangerously-skip-permissions is
+// injected into the auth subcommand.
+func runProfileLogin(alias, profileDir string, profile *Profile, email string) error {
+	claudePath, argv, env, err := BuildRunInvocation(alias, profileDir, profile, []string{"auth", "login", "--email", email})
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(claudePath, argv[1:]...)
+	cmd.Env = env
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	return cmd.Run()
 }
 
 // profileAuthStatus returns the signed-in account email for a profile, if the
-// profile is authenticated (via `claude auth status --json`).
-func profileAuthStatus(cpmPath, alias string) (string, bool) {
-	out, err := exec.Command(cpmPath, "run", alias, "auth", "status", "--json").Output()
+// profile is authenticated (via `claude auth status --json`). See
+// runProfileLogin for why this calls BuildRunInvocation directly rather than
+// shelling out to a nested `cpm run`.
+func profileAuthStatus(alias, profileDir string, profile *Profile) (string, bool) {
+	claudePath, argv, env, err := BuildRunInvocation(alias, profileDir, profile, []string{"auth", "status", "--json"})
+	if err != nil {
+		return "", false
+	}
+	cmd := exec.Command(claudePath, argv[1:]...)
+	cmd.Env = env
+	out, err := cmd.Output()
 	if err != nil {
 		return "", false
 	}

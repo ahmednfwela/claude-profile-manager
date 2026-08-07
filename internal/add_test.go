@@ -1,10 +1,13 @@
 package internal
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -111,6 +114,132 @@ func TestAppendProfileBlock(t *testing.T) {
 	}
 	if len(cfg.Profiles) != 2 {
 		t.Errorf("want 2 profiles, got %d", len(cfg.Profiles))
+	}
+	// The rename-based write must never leave a temp/lock sidecar behind on
+	// the success path.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "config.toml" {
+			t.Errorf("stray sidecar file left behind after append: %s", e.Name())
+		}
+	}
+}
+
+// TestAppendProfileBlockConcurrentNoLostUpdate exercises the blocking finding
+// directly: appendProfileBlock previously did a bare read-modify-write with
+// no locking, so two concurrent `cpm add` invocations (e.g. a local add
+// racing a fleet peer's add over SSH) could both read the same pre-append
+// content and race the write, silently discarding one another's appended
+// block. With the lock in place, every concurrent append must survive.
+func TestAppendProfileBlockConcurrentNoLostUpdate(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("source_dir = \"~/.claude\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			alias := fmt.Sprintf("acct%d", i)
+			block := RenderProfileBlock(alias, fmt.Sprintf("a%d@example.com", i), "d", nil, "", nil, nil)
+			errs[i] = appendProfileBlock(cfgPath, block)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent append %d failed: %v", i, err)
+		}
+	}
+
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg Config
+	if err := toml.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("config no longer parses after concurrent appends: %v\n---\n%s", err, data)
+	}
+	if len(cfg.Profiles) != n {
+		t.Errorf("want %d profiles after %d concurrent appends (no lost updates), got %d:\n%s", n, n, len(cfg.Profiles), data)
+	}
+	for i := 0; i < n; i++ {
+		alias := fmt.Sprintf("acct%d", i)
+		if _, ok := cfg.Profiles[alias]; !ok {
+			t.Errorf("profile %q lost to a concurrent write", alias)
+		}
+	}
+}
+
+// TestAppendProfileBlockReapsStaleLock verifies a lock file orphaned by a
+// process that crashed/was killed while holding it does not wedge every
+// future `cpm add` shut — it must be reaped once old enough.
+func TestAppendProfileBlockReapsStaleLock(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("source_dir = \"~/.claude\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	lockPath := cfgPath + ".lock"
+	if err := os.WriteFile(lockPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(lockPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	block := RenderProfileBlock("digrum1", "claude1@digrum.com", "d", nil, "", nil, nil)
+	start := time.Now()
+	if err := appendProfileBlock(cfgPath, block); err != nil {
+		t.Fatalf("append should reap the stale lock and succeed, got: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("append took %v — stale lock should be reaped immediately, not waited out", elapsed)
+	}
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Errorf("lock file should be removed after a successful append")
+	}
+}
+
+// TestRunProfileLoginErrorsWithoutClaudeOnPath covers the safety-relevant
+// bug: `cpm add`'s default --login=true path used to shell out to a nested
+// `cpm run <alias> auth login` subprocess that never resolved the parent's
+// --config (cobra's DisableFlagParsing on `run` makes --config unsteerable
+// from the child's own argv, at any position — see runProfileLogin's doc
+// comment), so it silently fell back to the REAL
+// ~/.claude-profiles/config.toml regardless of what config a caller (e.g. a
+// test/scratch harness) was actually using. runProfileLogin now calls
+// BuildRunInvocation directly with the alias/profileDir/profile the caller
+// already resolved, so there is no second, unsteerable config resolution
+// left to get wrong — its signature no longer even accepts a config path.
+// This test exercises the real function body (no mocking) through to
+// BuildRunInvocation's exec.LookPath("claude") failure, confirming the
+// wiring is correct without needing a real claude binary or a real OAuth
+// flow.
+func TestRunProfileLoginErrorsWithoutClaudeOnPath(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // guarantee `claude` cannot be found
+	p := &Profile{}
+	if err := runProfileLogin("test1", t.TempDir(), p, "test1@example.com"); err == nil {
+		t.Error("expected an error when claude is not on PATH")
+	}
+}
+
+func TestProfileAuthStatusFalseWithoutClaudeOnPath(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	p := &Profile{}
+	if acct, ok := profileAuthStatus("test1", t.TempDir(), p); ok {
+		t.Errorf("expected ok=false when claude is not on PATH, got acct=%q", acct)
 	}
 }
 
