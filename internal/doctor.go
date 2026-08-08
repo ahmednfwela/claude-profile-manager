@@ -135,6 +135,26 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%dd", int(d.Hours()/24))
 }
 
+// GetCredentialInfo reads a profile's .credentials.json and reports its
+// account identifier and expiry state.
+//
+// The REAL shape written by Claude Code nests everything under
+// claudeAiOauth (claudeAiOauth.expiresAt, a MILLISECOND epoch — confirmed
+// live: a freshly-minted token's expiresAt is exactly +8h from its file
+// mtime in ms, not seconds). The flat top-level expires_at/expires_in/email
+// keys checked below were never confirmed against a real credentials file;
+// they are kept only as a legacy-shape fallback for compatibility. Before
+// this fix, GetCredentialInfo looked ONLY at the flat keys, so every real
+// profile's expiry silently read as "valid" regardless of actual state
+// (live-verified: `cpm credentials` reported "(unknown account) [valid]" for
+// 6/6 profiles while 5 had access tokens already expired by 8-22h) — this is
+// the same file cpm fleet creds now reads via CredSnapshot, so the two must
+// not disagree about it.
+//
+// GetCredentialInfo does not know a profile's configured email (only the
+// credentials file, which the real shape never carries) — a caller with
+// access to Config should prefer cfg.Profiles[alias].Email over
+// "(unknown account)" when this returns that sentinel.
 func GetCredentialInfo(profileDir string) (account string, expired bool, err error) {
 	credPath := filepath.Join(profileDir, ".credentials.json")
 	data, err := os.ReadFile(credPath)
@@ -147,7 +167,8 @@ func GetCredentialInfo(profileDir string) (account string, expired bool, err err
 		return "", false, fmt.Errorf("cannot parse credentials")
 	}
 
-	// Try to extract account info
+	// Try to extract account info (legacy flat shape only; the real
+	// claudeAiOauth shape carries no account identifier at all).
 	if email, ok := creds["email"].(string); ok {
 		account = email
 	} else if sub, ok := creds["subject"].(string); ok {
@@ -158,12 +179,20 @@ func GetCredentialInfo(profileDir string) (account string, expired bool, err err
 		account = "(unknown account)"
 	}
 
-	// Check expiry
+	// Real shape: claudeAiOauth.expiresAt, milliseconds.
+	if oauth, ok := creds["claudeAiOauth"].(map[string]any); ok {
+		if expiresAtMs, ok := oauth["expiresAt"].(float64); ok {
+			expTime := time.UnixMilli(int64(expiresAtMs))
+			return account, time.Now().After(expTime), nil
+		}
+	}
+
+	// Legacy/fallback shape: flat seconds-epoch expires_at, or a relative
+	// expires_in measured from the file's mtime.
 	if expiresAt, ok := creds["expires_at"].(float64); ok {
 		expTime := time.Unix(int64(expiresAt), 0)
 		expired = time.Now().After(expTime)
 	} else if expiresIn, ok := creds["expires_in"].(float64); ok {
-		// expires_in is relative — check file mod time
 		info, statErr := os.Stat(credPath)
 		if statErr == nil {
 			expTime := info.ModTime().Add(time.Duration(expiresIn) * time.Second)

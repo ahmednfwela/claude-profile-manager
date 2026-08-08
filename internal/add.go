@@ -136,8 +136,18 @@ func acquireConfigLock(configPath string) (release func(), err error) {
 // truncated/partially written — it is always either its full previous
 // content or its full new content, never anything in between.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	return writeFileAtomicPattern(path, data, perm, ".cpm-config-*.tmp")
+}
+
+// writeFileAtomicPattern is writeFileAtomic generalized over the temp-file
+// glob pattern, so callers writing a different class of file (e.g.
+// fleetcreds.go's credential pulls, which use ".cpm-cred-*.tmp" so an
+// interrupted transfer's leftover temp file is recognizable at a glance) get
+// the same atomicity guarantee without colliding on cpm's config-append temp
+// pattern.
+func writeFileAtomicPattern(path string, data []byte, perm os.FileMode, tmpPattern string) error {
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".cpm-config-*.tmp")
+	tmp, err := os.CreateTemp(dir, tmpPattern)
 	if err != nil {
 		return fmt.Errorf("cannot create temp file: %w", err)
 	}
