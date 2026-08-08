@@ -633,3 +633,20 @@ func TestFleetCredsVerify_RejectsInvalidAlias(t *testing.T) {
 		})
 	}
 }
+
+func TestRemoteBinDir(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},                                 // no configured cpm path
+		{"cpm", ""},                              // bare name resolved on PATH
+		{"~/dev/bin/cpm", "$HOME/dev/bin"},       // the live macbook shape (root-owned ~/.local)
+		{"~/cpm", "$HOME"},                       // home-root binary
+		{"/usr/local/bin/cpm", "/usr/local/bin"}, // absolute POSIX path
+		{`C:\tools\cpm.exe`, "C:/tools"},         // windows separators normalized
+		{"  ~/dev/bin/cpm  ", "$HOME/dev/bin"},   // surrounding whitespace trimmed
+	}
+	for _, c := range cases {
+		if got := remoteBinDir(c.in); got != c.want {
+			t.Errorf("remoteBinDir(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

@@ -384,6 +384,32 @@ func remoteCredPath(peer *FleetPeer, alias string) string {
 	return remoteProfileDir(peer, alias) + "/.credentials.json"
 }
 
+// remoteBinDir returns the directory of the peer's configured cpm binary in
+// remote-POSIX form ("/" separators, leading "~" rewritten to "$HOME" so it
+// expands inside a double-quoted PATH assignment), or "" when the peer has no
+// explicit cpm path (bare name resolved on PATH) and there is no dir to derive.
+// The peer's launchers are installed beside its cpm binary, so this is the one
+// directory guaranteed to hold claude-<alias> on that machine.
+func remoteBinDir(cpmPath string) string {
+	p := strings.TrimSpace(cpmPath)
+	if p == "" {
+		return ""
+	}
+	p = strings.ReplaceAll(p, "\\", "/")
+	i := strings.LastIndex(p, "/")
+	if i <= 0 { // bare command name, or a root-level path with no usable dir
+		return ""
+	}
+	dir := p[:i]
+	if dir == "~" {
+		return "$HOME"
+	}
+	if strings.HasPrefix(dir, "~/") {
+		return "$HOME" + dir[1:]
+	}
+	return dir
+}
+
 // --- transport: remote command construction ---------------------------------
 
 // readRemoteCmd builds the POSIX remote command that reads a peer's
@@ -890,8 +916,16 @@ func FleetCredsVerify(cfg *Config, configPath, peerName, alias string) error {
 		// PATH prefix is mandatory: `claude`/the launcher is frequently NOT on
 		// the non-interactive SSH PATH (only the interactive login shell's
 		// profile puts it there) — live-verified on the darwin peer this design
-		// was validated against.
-		remoteCmd = fmt.Sprintf(`PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH" %s -p "reply with the single word OK" --output-format text`, launcher)
+		// was validated against. The peer's own launcher dir (derived from its
+		// configured cpm path) must lead the prefix: a peer whose ~/.local is
+		// unusable installs launchers elsewhere entirely (live case: root-owned
+		// ~/.local on the macbook peer put them in ~/dev/bin, and bare
+		// `claude-<alias>` failed with "command not found" under zsh -c).
+		pathPrefix := `$HOME/.local/bin:/opt/homebrew/bin`
+		if dir := remoteBinDir(peer.CPM); dir != "" {
+			pathPrefix = dir + ":" + pathPrefix
+		}
+		remoteCmd = fmt.Sprintf(`PATH="%s:$PATH" %s -p "reply with the single word OK" --output-format text`, pathPrefix, launcher)
 	}
 
 	stdout, stderr, code, err := sshCapture(peer.Host, remoteCmd)
