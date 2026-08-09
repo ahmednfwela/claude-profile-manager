@@ -1,12 +1,24 @@
 name: Release
 
+# Fully automated releases (2026-08-09): a push to main runs semantic-release,
+# which computes the next version from Conventional Commits, pushes the tag, and
+# creates the GitHub Release with generated notes. GoReleaser then attaches the
+# cross-platform binaries to that release IN THE SAME JOB — it cannot run from a
+# separate on-tag workflow, because a tag pushed with the default GITHUB_TOKEN
+# never triggers other workflows (GitHub Actions recursion prevention).
+# The on-tag trigger remains only as a manual escape hatch (a human-pushed tag
+# still releases; semantic-release steps skip on tag refs).
+
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
+  issues: write
+  pull-requests: write
 
 jobs:
   test:
@@ -25,13 +37,35 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: actions/setup-node@v4
+        if: github.ref_type == 'branch'
+        with:
+          node-version: "22"
+      - name: semantic-release (version, tag, GitHub release)
+        if: github.ref_type == 'branch'
+        run: npx --yes semantic-release@24
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: detect release tag on HEAD
+        id: tag
+        run: |
+          git fetch --tags --force
+          if TAG=$(git describe --tags --exact-match HEAD 2>/dev/null); then
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "release tag on HEAD: $TAG"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "no release tag on HEAD — nothing to build"
+          fi
       - uses: actions/setup-go@v5
+        if: steps.tag.outputs.tag != ''
         with:
           go-version: "1.26.x"
-      - uses: goreleaser/goreleaser-action@v6
+      - name: goreleaser (build + attach binaries)
+        if: steps.tag.outputs.tag != ''
+        uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

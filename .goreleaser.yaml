@@ -22,10 +22,22 @@ builds:
 archives:
   # `cpm channel serve` execs this; it must ship WITH the binary. The bundle has the
   # MCP SDK inlined, so a release needs no node_modules.
+  # CAVEAT (unverified): goreleaser may ignore `files` for format:binary archives —
+  # no release since this line was added has been inspected for the bundle asset.
   - files:
       - channel/httpchan.bundle.mjs
     format: binary
-    name_template: 'cpm_{{ .Os }}_{{ .Arch }}{{ if eq .Os "windows" }}.exe{{ end }}'
+    # goreleaser appends the binary's own extension for format:binary, so the
+    # template must NOT add .exe itself — v0.4.0 shipped `cpm_windows_amd64.exe.exe`
+    # because of the old conditional. The self-updater matches by
+    # Contains("cpm_<os>_<arch>[.exe]"), so the single-extension name still matches.
+    name_template: "cpm_{{ .Os }}_{{ .Arch }}"
+
+release:
+  # semantic-release creates the GitHub Release (with generated notes) before
+  # goreleaser runs; keep-existing makes goreleaser only ATTACH binaries instead
+  # of replacing the release body with its raw commit-list changelog.
+  mode: keep-existing
 
 checksum:
   name_template: "checksums.txt"
