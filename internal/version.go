@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // Set via ldflags at build time
@@ -136,10 +137,20 @@ func Upgrade(binDir string) error {
 
 	// Replace current binary. Windows locks the running image, so move the
 	// running exe aside first (a running exe can be renamed but not overwritten).
+	//
+	// The aside name must be UNIQUE per upgrade: with a fixed ".old", the .old
+	// from a PREVIOUS upgrade is still the running image of any long-lived
+	// `cpm run` parent started before it — locked, so Remove fails, then the
+	// running exe cannot move aside (rename onto an existing name), and the
+	// whole upgrade dies "Access is denied" (hit live 2026-08-09 upgrading
+	// 0.5.0→0.5.1 under active background lanes). Unique names sidestep the
+	// lock entirely; stale asides are reaped best-effort once nothing runs
+	// their image anymore.
 	targetPath := filepath.Join(binDir, binaryName())
 	if runtime.GOOS == "windows" {
-		_ = os.Remove(targetPath + ".old")
-		_ = os.Rename(targetPath, targetPath+".old")
+		reapStaleAsides(binDir)
+		aside := fmt.Sprintf("%s.old-%d-%d", targetPath, os.Getpid(), time.Now().UnixNano())
+		_ = os.Rename(targetPath, aside)
 	}
 	if err := os.Rename(tmpPath, targetPath); err != nil {
 		os.Remove(tmpPath)
@@ -148,4 +159,22 @@ func Upgrade(binDir string) error {
 
 	fmt.Printf("Updated to %s\n", release.TagName)
 	return nil
+}
+
+// reapStaleAsides best-effort deletes leftover cpm.exe.old* files from earlier
+// upgrades. A file whose image some process still runs is locked and its Remove
+// simply fails — that is fine; it gets reaped on a later upgrade once the last
+// process using it exits. Never returns an error: reaping is hygiene, not a
+// precondition.
+func reapStaleAsides(binDir string) {
+	entries, err := os.ReadDir(binDir)
+	if err != nil {
+		return
+	}
+	prefix := binaryName() + ".old"
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), prefix) {
+			_ = os.Remove(filepath.Join(binDir, e.Name()))
+		}
+	}
 }
