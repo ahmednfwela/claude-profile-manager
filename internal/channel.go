@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/jakubkontra/cpm/channel"
 )
 
 // DefaultChannelBasePort is the first port of the per-profile channel range. A
@@ -279,7 +281,60 @@ func ChannelServerScript() (string, error) {
 			return c, nil
 		}
 	}
-	return "", fmt.Errorf("channel server not found; looked in: %s | build it with: "+
+	// No on-disk copy — the NORMAL case for a released binary: goreleaser ships
+	// bare binaries (its format:binary ignores archive `files:`, proven on the
+	// v0.5.0 release), so channel/ never exists next to the exe. Extract the
+	// embedded bundle to a version-scoped cache path; version-scoping makes an
+	// upgrade self-invalidating with no staleness comparison.
+	if p, err := extractEmbeddedBundle(); err == nil {
+		return p, nil
+	}
+	return "", fmt.Errorf("channel server not found; looked in: %s (and embedded-bundle extraction failed) | build it with: "+
 		"cd channel && npm install && bun build httpchan.mjs --target=node --outfile=httpchan.bundle.mjs",
 		strings.Join(candidates, ", "))
+}
+
+// extractEmbeddedBundle writes the go:embed-ded channel server bundle to a
+// version-scoped per-user cache path and returns it. Concurrent extraction is
+// race-safe: each writer uses a unique temp file, and a losing rename defers to
+// the winner's already-present file.
+func extractEmbeddedBundle() (string, error) {
+	if len(channel.BundleMJS) == 0 {
+		return "", fmt.Errorf("embedded channel bundle is empty")
+	}
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	dst := filepath.Join(cacheDir, "cpm", "channel", Version, "httpchan.bundle.mjs")
+	if _, err := os.Stat(dst); err == nil {
+		return dst, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dst), "httpchan-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(channel.BundleMJS); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return "", err
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		os.Remove(tmpPath)
+		// A concurrent extraction may have won the rename (Windows refuses to
+		// rename over an existing file) — the winner's copy is byte-identical.
+		if _, serr := os.Stat(dst); serr == nil {
+			return dst, nil
+		}
+		return "", err
+	}
+	return dst, nil
 }

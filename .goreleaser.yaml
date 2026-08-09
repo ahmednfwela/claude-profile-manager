@@ -20,13 +20,11 @@ builds:
       - -X github.com/jakubkontra/cpm/internal.Commit={{.ShortCommit}}
 
 archives:
-  # `cpm channel serve` execs this; it must ship WITH the binary. The bundle has the
-  # MCP SDK inlined, so a release needs no node_modules.
-  # CAVEAT (unverified): goreleaser may ignore `files` for format:binary archives —
-  # no release since this line was added has been inspected for the bundle asset.
-  - files:
-      - channel/httpchan.bundle.mjs
-    format: binary
+  # NOTE: no `files:` here — goreleaser silently IGNORES it for format:binary
+  # (proven on the v0.5.0 assets). The channel server bundle ships INSIDE the
+  # binary instead (go:embed in channel/embed.go; extracted on demand by
+  # internal/channel.go extractEmbeddedBundle).
+  - format: binary
     # goreleaser appends the binary's own extension for format:binary, so the
     # template must NOT add .exe itself — v0.4.0 shipped `cpm_windows_amd64.exe.exe`
     # because of the old conditional. The self-updater matches by
