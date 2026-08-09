@@ -514,6 +514,14 @@ func credentialsCmd() *cobra.Command {
 				if err != nil {
 					fmt.Printf("  claude-%-20s %s\n", name, err)
 				} else {
+					// The real credentials file never carries an account
+					// identifier (see GetCredentialInfo's doc comment) — prefer
+					// the profile's own configured email over the sentinel.
+					if account == "(unknown account)" {
+						if p := cfg.Profiles[name]; p != nil && p.Email != "" {
+							account = p.Email
+						}
+					}
 					status := "valid"
 					if expired {
 						status = "EXPIRED"
@@ -774,6 +782,7 @@ func fleetCmd() *cobra.Command {
 	}
 	cmd.AddCommand(fleetStatusCmd())
 	cmd.AddCommand(fleetSyncCmd())
+	cmd.AddCommand(fleetCredsCmd())
 	return cmd
 }
 
@@ -930,6 +939,172 @@ func fleetSyncCmd() *cobra.Command {
 			return internal.FleetSync(cfg, configPath)
 		},
 	}
+}
+
+// fleetCredsCmd is the `cpm fleet creds` parent: three verbs under the
+// existing `fleet` group, deliberately NOT a top-level `cpm creds` (which
+// would sit confusingly beside the existing top-level `cpm credentials` —
+// local-only status, unrelated). With no subcommand it behaves as `status`.
+func fleetCredsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "creds [alias...]",
+		Short: "Sync .credentials.json across fleet peers (explicit, one-shot; never automatic)",
+		Long: "Move a Claude account's OAuth credentials between this machine and a fleet\n" +
+			"peer over an SSH stdin/stdout pipe -- never through argv, never through the\n" +
+			"git-backed cloud channel. With no subcommand, `cpm fleet creds` behaves as\n" +
+			"`cpm fleet creds status`.\n\n" +
+			"This is a one-shot handoff, not replication: each account has a \"home\"\n" +
+			"machine at any moment, and push/pull moves it. Two machines sharing one\n" +
+			"refresh-token chain WILL race the next time either refreshes (access tokens\n" +
+			"live ~8h) -- whichever refreshes first rotates the shared refresh token dead\n" +
+			"and the other machine's session silently breaks. Recovery is a re-push/pull\n" +
+			"from whichever machine still holds a live chain, not a browser login. Run\n" +
+			"`cpm fleet creds status` first to see fingerprint divergence before it bites.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := internal.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+			return internal.FleetCredsStatus(cfg, configPath, args, internal.CredSyncOpts{})
+		},
+	}
+	cmd.AddCommand(fleetCredsStatusCmd())
+	cmd.AddCommand(fleetCredsPushCmd())
+	cmd.AddCommand(fleetCredsPullCmd())
+	cmd.AddCommand(fleetCredsVerifyCmd())
+	return cmd
+}
+
+func fleetCredsStatusCmd() *cobra.Command {
+	var peers []string
+	cmd := &cobra.Command{
+		Use:   "status [alias...]",
+		Short: "Read-only credential matrix: local vs every peer, per profile",
+		Long: "Prints, per profile alias, this machine's credential state and every\n" +
+			"reachable peer's, plus a lineage fingerprint (fp) -- a 12-hex-char prefix of\n" +
+			"sha256(refreshToken), never the secret itself: a 48-bit prefix of SHA-256\n" +
+			"over a high-entropy token is not invertible. Same fp on two machines means\n" +
+			"the same token chain (safe); different fp means two independent logins\n" +
+			"racing (the fight condition) -- flagged as DIVERGENT LINEAGE. Comparisons use\n" +
+			"the server-issued expiresAt, never mtime (immune to clock skew between\n" +
+			"machines). Never writes anything, local or remote.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := internal.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+			return internal.FleetCredsStatus(cfg, configPath, args, internal.CredSyncOpts{Peers: peers})
+		},
+	}
+	cmd.Flags().StringArrayVar(&peers, "peer", nil, "narrow to this peer (repeatable)")
+	return cmd
+}
+
+func fleetCredsPushCmd() *cobra.Command {
+	var peers []string
+	var all, yes, force, dryRun, includeMCP bool
+	cmd := &cobra.Command{
+		Use:   "push [alias...]",
+		Short: "Push local credentials to peer(s) -- \"/login here, propagate there\"",
+		Long: "Sends this machine's .credentials.json for the given profile(s) to every\n" +
+			"reachable peer (or --peer, repeatable, to narrow), over an SSH stdin pipe\n" +
+			"(umask 077; cat > tmp && chmod 600 && mv -f) -- never argv, never scp, never\n" +
+			"base64 on the wire. Only claudeAiOauth is overwritten on the peer; the\n" +
+			"peer's own mcpOAuth grants and unknown top-level keys are preserved unless\n" +
+			"--include-mcp is passed.\n\n" +
+			"Refuses rather than half-working: a peer whose session holds a strictly\n" +
+			"NEWER token, or a source whose refresh token has already expired, is refused\n" +
+			"unless you pass --force (distinct from --yes on purpose); a peer missing the\n" +
+			"profile directory is refused with a `cpm fleet sync` hint; the shared\n" +
+			"\"default\"/~/.claude identity is always refused; pushing to a Windows peer is\n" +
+			"never supported (use `cpm fleet creds pull` there instead). --dry-run prints\n" +
+			"the full plan and writes nothing. --yes is required when stdin is not a\n" +
+			"terminal (dispatch/background), otherwise the command errors instead of\n" +
+			"hanging on a prompt.\n\n" +
+			"Exactly one of alias args or --all is required.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := internal.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+			return internal.FleetCredsPush(cfg, configPath, args, internal.CredSyncOpts{
+				Peers: peers, All: all, Yes: yes, Force: force, DryRun: dryRun, IncludeMCP: includeMCP,
+			})
+		},
+	}
+	cmd.Flags().StringArrayVar(&peers, "peer", nil, "push only to this peer (repeatable; default: every reachable peer)")
+	cmd.Flags().BoolVar(&all, "all", false, "every locally-authenticated profile that passes the guards (mutually exclusive with alias args; required together, one or the other)")
+	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "assume yes to the routine overwrite prompt; required when stdin is not a TTY")
+	cmd.Flags().BoolVar(&force, "force", false, "override a hard refusal (newer peer, dead source token, MCP clobber) -- distinct from --yes")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the full plan and exit 0; no SSH writes")
+	cmd.Flags().BoolVar(&includeMCP, "include-mcp", false, "also transport mcpOAuth (default off -- would clobber the peer's own third-party MCP grants)")
+	return cmd
+}
+
+func fleetCredsPullCmd() *cobra.Command {
+	var peers []string
+	var all, yes, force, dryRun, includeMCP bool
+	cmd := &cobra.Command{
+		Use:   "pull [alias...]",
+		Short: "Pull credentials from one peer into this machine -- the Windows-destination route",
+		Long: "Reads .credentials.json for the given profile(s) from ONE named peer (SSH\n" +
+			"stdout capture, stdout/stderr kept separate so a banner line can never splice\n" +
+			"into the JSON) and writes it locally with an atomic temp+rename at 0600.\n" +
+			"--peer is required whenever more than one peer is configured -- a pull has no\n" +
+			"sensible \"merge from all\" semantics.\n\n" +
+			"This is the only supported way to bring a Windows machine's profile up to\n" +
+			"date from a peer: `push` TO a Windows peer is refused outright (piping data on\n" +
+			"stdin while also passing a PowerShell script through two shells' quoting\n" +
+			"layers has a silent-corruption failure mode on a credentials file), so\n" +
+			"pushing FROM Windows and pulling ON Windows are the two routes into a Windows\n" +
+			"box. Same guards as push (newer local copy, dead source, MCP clobber, missing\n" +
+			"local profile dir, shared identity, --yes required off a TTY).\n\n" +
+			"Exactly one of alias args or --all is required.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := internal.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+			return internal.FleetCredsPull(cfg, configPath, args, internal.CredSyncOpts{
+				Peers: peers, All: all, Yes: yes, Force: force, DryRun: dryRun, IncludeMCP: includeMCP,
+			})
+		},
+	}
+	cmd.Flags().StringArrayVar(&peers, "peer", nil, "pull from this peer (required when more than one peer is configured)")
+	cmd.Flags().BoolVar(&all, "all", false, "every profile configured locally (mutually exclusive with alias args)")
+	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "assume yes to the routine overwrite prompt; required when stdin is not a TTY")
+	cmd.Flags().BoolVar(&force, "force", false, "override a hard refusal (newer local copy, dead source token, MCP clobber) -- distinct from --yes")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the full plan and exit 0; no local writes")
+	cmd.Flags().BoolVar(&includeMCP, "include-mcp", false, "also transport mcpOAuth (default off)")
+	return cmd
+}
+
+func fleetCredsVerifyCmd() *cobra.Command {
+	var peer string
+	cmd := &cobra.Command{
+		Use:   "verify <alias>",
+		Short: "Run a real headless auth check on a peer to prove a pushed file actually works",
+		Long: "Runs `claude-<alias> -p \"reply with the single word OK\" --output-format\n" +
+			"text` on the named peer over non-interactive SSH -- no GUI, no keychain\n" +
+			"unlock available. A response proves the profile's .credentials.json file\n" +
+			"alone is authenticating that session: cpm never reads, writes, or unlocks\n" +
+			"the macOS Keychain (v1 scope is file-store only), so this is the concrete,\n" +
+			"live check that the pushed file -- not a stale Keychain item -- is what the\n" +
+			"peer's session actually used.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if peer == "" {
+				return fmt.Errorf("--peer is required")
+			}
+			cfg, err := internal.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+			return internal.FleetCredsVerify(cfg, configPath, peer, args[0])
+		},
+	}
+	cmd.Flags().StringVar(&peer, "peer", "", "peer to verify against (required)")
+	return cmd
 }
 
 func sortedKeys(m map[string]*internal.Profile) []string {

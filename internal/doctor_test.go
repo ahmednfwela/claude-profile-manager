@@ -140,6 +140,79 @@ func TestGetCredentialInfoExpired(t *testing.T) {
 	}
 }
 
+// TestGetCredentialInfo_ClaudeAiOauthExpiry covers the real credentials
+// shape (nested claudeAiOauth.expiresAt, millisecond epoch) that
+// GetCredentialInfo previously never looked at -- it only checked flat
+// legacy keys, so every real profile silently read as "valid" regardless of
+// actual expiry (live-verified: `cpm credentials` reported
+// "(unknown account) [valid]" for 6/6 profiles while 5 had access tokens
+// already expired). This is the same file cpm fleet creds's CredSnapshot
+// reads, so the two must not disagree.
+func TestGetCredentialInfo_ClaudeAiOauthExpiry(t *testing.T) {
+	dir := t.TempDir()
+	pastMs := time.Now().Add(-time.Hour).UnixMilli()
+	creds := map[string]any{
+		"claudeAiOauth": map[string]any{
+			"expiresAt":    float64(pastMs),
+			"refreshToken": "fake-refresh-token",
+		},
+	}
+	data, _ := json.Marshal(creds)
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, expired, err := GetCredentialInfo(dir)
+	if err != nil {
+		t.Fatalf("GetCredentialInfo failed: %v", err)
+	}
+	if !expired {
+		t.Error("claudeAiOauth.expiresAt in the past should report expired=true")
+	}
+}
+
+func TestGetCredentialInfo_ClaudeAiOauthNotExpired(t *testing.T) {
+	dir := t.TempDir()
+	futureMs := time.Now().Add(3 * time.Hour).UnixMilli()
+	creds := map[string]any{
+		"claudeAiOauth": map[string]any{
+			"expiresAt": float64(futureMs),
+		},
+	}
+	data, _ := json.Marshal(creds)
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, expired, err := GetCredentialInfo(dir)
+	if err != nil {
+		t.Fatalf("GetCredentialInfo failed: %v", err)
+	}
+	if expired {
+		t.Error("claudeAiOauth.expiresAt in the future should report expired=false")
+	}
+}
+
+// Legacy flat expires_at (seconds epoch) must still work -- this is the
+// exact fixture TestGetCredentialInfoWithEmail/Expired above already cover,
+// re-asserted here explicitly as the "fallback path" half of the doctor.go
+// fix contract.
+func TestGetCredentialInfo_LegacyExpiresAtStillHonored(t *testing.T) {
+	dir := t.TempDir()
+	creds := map[string]any{"expires_at": float64(time.Now().Add(time.Hour).Unix())}
+	data, _ := json.Marshal(creds)
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, expired, err := GetCredentialInfo(dir)
+	if err != nil {
+		t.Fatalf("GetCredentialInfo failed: %v", err)
+	}
+	if expired {
+		t.Error("legacy expires_at in the future should report expired=false")
+	}
+}
+
 func TestFormatDuration(t *testing.T) {
 	tests := []struct {
 		d    time.Duration

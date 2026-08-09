@@ -45,7 +45,10 @@ func TestBuildRunInvocationBypassSkipsArgs(t *testing.T) {
 	// Every bypassed subcommand must NOT receive the profile decoration —
 	// claude treats flags-before-subcommand as a prompt, so decoration turns
 	// e.g. `stop <id>` into a billed model turn (observed live 2026-07-15).
-	for _, sub := range []string{"mcp", "stop", "attach", "logs", "respawn", "daemon", "rm", "config"} {
+	// "auth" is included because add.go's runProfileLogin/profileAuthStatus
+	// depend on it staying bypassed: BuildRunInvocation decorating `auth
+	// login` with --dangerously-skip-permissions would be a real regression.
+	for _, sub := range []string{"mcp", "auth", "stop", "attach", "logs", "respawn", "daemon", "rm", "config"} {
 		_, argv, _, err := BuildRunInvocation("glm", t.TempDir(), p, []string{sub, "arg1"})
 		if err != nil {
 			t.Fatalf("BuildRunInvocation(%s): %v", sub, err)

@@ -3,8 +3,45 @@ package internal
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// TestGatherSyncFilesStillExcludesCredentials is a regression guard for the
+// fleet-creds feature: cpm cloud's allowlist (cloudSyncFiles/cloudSyncDirs/
+// cloudSyncExternal) must never grow to enumerate .credentials.json, and the
+// generated .gitignore must keep it as a second layer of defense. Fleet
+// credential sync moves secrets over an SSH stdin/stdout pipe ONLY -- never
+// through this git-backed channel.
+func TestGatherSyncFilesStillExcludesCredentials(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "source")
+	os.MkdirAll(sourceDir, 0o755)
+
+	// A real credentials file sitting right where cloud sync would look for
+	// its allowlisted files/dirs, so a regression that widens the allowlist
+	// would actually pick it up in this test.
+	os.WriteFile(filepath.Join(sourceDir, ".credentials.json"), []byte(`{"claudeAiOauth":{"refreshToken":"fake"}}`), 0o644)
+	os.WriteFile(filepath.Join(sourceDir, "settings.json"), []byte(`{}`), 0o644)
+
+	cfg := &Config{SourceDir: sourceDir}
+	files, err := GatherSyncFiles(cfg, filepath.Join(tmpDir, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for repoPath, srcPath := range files {
+		// Check the repo-relative path and the SOURCE FILENAME only (not the
+		// full srcPath -- t.TempDir() embeds the test's own name, which
+		// itself contains "Credentials" and would otherwise false-positive).
+		if strings.Contains(strings.ToLower(repoPath), "credential") || strings.Contains(strings.ToLower(filepath.Base(srcPath)), "credential") {
+			t.Errorf("GatherSyncFiles must never return a credentials path, got repoPath=%q srcPath=%q", repoPath, srcPath)
+		}
+	}
+
+	if !strings.Contains(cloudGitignore, ".credentials.json") {
+		t.Errorf("cloudGitignore must still list .credentials.json as a second layer of defense")
+	}
+}
 
 func TestGatherSyncFiles(t *testing.T) {
 	tmpDir := t.TempDir()

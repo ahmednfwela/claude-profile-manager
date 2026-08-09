@@ -1,6 +1,8 @@
 package internal
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os/exec"
 	"sort"
@@ -15,16 +17,81 @@ var sshBaseOpts = []string{
 	"-o", "ConnectTimeout=10",
 }
 
-// sshRun runs `ssh <host> <remoteCmd>` and returns combined output. remoteCmd is
-// passed as a SINGLE argument so the remote login shell interprets it (expanding
-// ~ etc.) and so local path-mangling layers (MSYS/Git-Bash) never rewrite a bare
-// leading-path token. Callers must only build remoteCmd from validated/trusted
-// values (safe alias/email + config-controlled paths) — never secrets.
+// sshCmdArgs returns the argv for `ssh <host> <remoteCmd>`, the single place
+// that assembles it so sshRun/sshCapture/sshPipe never drift apart.
+// remoteCmd is passed as ONE argument so the remote login shell interprets it
+// (expanding ~ etc.) and so local path-mangling layers (MSYS/Git-Bash) never
+// rewrite a bare leading-path token. Callers must only build remoteCmd from
+// validated/trusted values (safe alias/email + config-controlled paths) —
+// never secrets.
+func sshCmdArgs(host, remoteCmd string) []string {
+	return append(append([]string{}, sshBaseOpts...), host, remoteCmd)
+}
+
+// sshRun runs `ssh <host> <remoteCmd>` and returns combined output. Fine for
+// callers that only ever exchange non-secret, non-JSON text (config.toml
+// contents, `cpm add` output) — never use this for a credentials read, where
+// a stderr line spliced into stdout would corrupt the JSON. See sshCapture.
 func sshRun(host, remoteCmd string) (string, error) {
-	args := append(append([]string{}, sshBaseOpts...), host, remoteCmd)
-	cmd := exec.Command("ssh", args...)
+	cmd := exec.Command("ssh", sshCmdArgs(host, remoteCmd)...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// sshCapture runs `ssh <host> <remoteCmd>` with stdout and stderr captured
+// into SEPARATE buffers — never CombinedOutput. A stderr line (SSH banner,
+// warning) must never splice into a stdout payload that fleetcreds.go parses
+// as JSON credentials. code is the remote command's exit status; -1 means the
+// ssh process itself could not be run (not a remote exit code).
+func sshCapture(host, remoteCmd string) (stdout []byte, stderr string, code int, err error) {
+	cmd := exec.Command("ssh", sshCmdArgs(host, remoteCmd)...)
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	runErr := cmd.Run()
+	stdout, stderr = outBuf.Bytes(), errBuf.String()
+	if runErr == nil {
+		return stdout, stderr, 0, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		return stdout, stderr, exitErr.ExitCode(), nil
+	}
+	return stdout, stderr, -1, runErr
+}
+
+// buildSecretPipeCmd constructs (without running) the exec.Cmd used to pipe
+// stdin to a remote command over SSH. remoteCmd must never itself contain a
+// secret — it is built only from a validated alias and config-controlled
+// paths (see pushRemoteCmd). The secret payload travels ONLY via cmd.Stdin,
+// never argv. Split out from sshPipe so it can be unit-tested (inspecting
+// cmd.Args and cmd.Stdin) without ever invoking ssh.
+func buildSecretPipeCmd(host, remoteCmd string, stdin []byte) *exec.Cmd {
+	cmd := exec.Command("ssh", sshCmdArgs(host, remoteCmd)...)
+	cmd.Stdin = bytes.NewReader(stdin)
+	return cmd
+}
+
+// sshPipe runs `ssh <host> <remoteCmd>` with stdin piped from the caller —
+// the only transport this codebase uses to move credential bytes. No base64,
+// no scp: raw bytes over a non-TTY SSH channel are byte-exact, and scp
+// (SFTP under modern OpenSSH) creates the destination at default perms
+// (0644) before any chmod, leaving a world-readable window a stdin pipe
+// into `umask 077; cat >` never has.
+func sshPipe(host, remoteCmd string, stdin []byte) (stderr string, code int, err error) {
+	cmd := buildSecretPipeCmd(host, remoteCmd, stdin)
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	runErr := cmd.Run()
+	stderr = errBuf.String()
+	if runErr == nil {
+		return stderr, 0, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		return stderr, exitErr.ExitCode(), nil
+	}
+	return stderr, -1, runErr
 }
 
 // PeerReachable reports whether the peer answers a trivial SSH command.
@@ -162,7 +229,9 @@ func remoteAddProfile(peer *FleetPeer, email, alias string) (string, error) {
 
 // AddProfileToFleet adds the account locally, then propagates it to every
 // reachable peer by invoking the peer's own `cpm add` over SSH. It prints a
-// login matrix at the end (credentials are never transported).
+// login matrix at the end — this command itself never creates or copies
+// credentials; each peer still needs its own /login (or a subsequent
+// `cpm fleet creds push`, see fleetcreds.go, to hand off an existing one).
 func AddProfileToFleet(cfg *Config, configPath, email, alias, fromProfile string, loginNow bool) error {
 	f, err := fleetConfigured(cfg)
 	if err != nil {
@@ -289,7 +358,7 @@ func FleetSync(cfg *Config, configPath string) error {
 	if !changed {
 		fmt.Println("\nFleet already in sync — no profiles added.")
 	} else {
-		fmt.Println("\nFleet reconciled. Each newly-added profile still needs its own /login (credentials are never synced).")
+		fmt.Println("\nFleet reconciled. Each newly-added profile still needs its own /login — or, to propagate an existing login instead of a fresh sign-in, run: cpm fleet creds push <alias>")
 	}
 	return nil
 }
