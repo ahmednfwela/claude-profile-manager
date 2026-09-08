@@ -203,6 +203,11 @@ func appendProfileBlock(configPath, block string) error {
 // materializes the profile dir (seed settings, link shared dirs, optional MCP
 // sync), installs the launcher, and prints the login next-step. Credentials are
 // never created — the user must `/login` once.
+//
+// This is the LEGACY add path (design spec §4/OQ-8): it clones args/env/model
+// verbatim from a template profile, predating [base]. Kept as-is -- OQ-8
+// leaves retiring it to the owner -- alongside the new AddProfileWithAuth,
+// which composes from [base]+[auth] instead.
 func AddProfile(cfg *Config, configPath, email, alias, fromProfile string, loginNow bool) error {
 	if err := ValidateAlias(alias); err != nil {
 		return err
@@ -227,7 +232,71 @@ func AddProfile(cfg *Config, configPath, email, alias, fromProfile string, login
 	}
 	fmt.Printf("Added [profiles.%s] to %s (template: %s)\n", alias, ExpandPath(configPath), tmplName)
 
-	// Reload to validate the append parsed and to get the canonical profile.
+	return finishAddProfile(configPath, alias, email, loginNow)
+}
+
+// RenderAuthProfileBlock renders a `[profiles.<alias>]` + `[profiles.<alias>.
+// auth]` TOML block for `cpm add --auth-mode` (design spec §3/§4): it
+// composes from [base] by construction -- no args/env/model are copied from
+// a template profile, since [base] now supplies the common set. Deterministic
+// (sorted env keys), matching RenderProfileBlock's existing convention.
+func RenderAuthProfileBlock(alias, email, description, authMode string, authEnv map[string]string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n# %s — added by `cpm add --auth-mode`. Isolated CLAUDE_CONFIG_DIR; run `claude-%s`.\n", email, alias)
+	fmt.Fprintf(&b, "[profiles.%s]\n", alias)
+	fmt.Fprintf(&b, "description = %s\n", tomlValue(description))
+	fmt.Fprintf(&b, "email = %s\n", tomlValue(email))
+	fmt.Fprintf(&b, "\n[profiles.%s.auth]\n", alias)
+	fmt.Fprintf(&b, "mode = %s\n", tomlValue(authMode))
+	if len(authEnv) > 0 {
+		fmt.Fprintf(&b, "[profiles.%s.auth.env]\n", alias)
+		for _, k := range sortedEnvKeys(authEnv) {
+			fmt.Fprintf(&b, "%s = %s\n", k, tomlValue(authEnv[k]))
+		}
+	}
+	return b.String()
+}
+
+// AddProfileWithAuth adds a new account profile using the [base]+[auth]
+// schema (design spec §3/§4) instead of cloning a template profile's raw
+// args/env: TemplateProfileName/IsMaxProfile selection is not used on this
+// path at all -- [base] supplies the common args/env by construction
+// (RenderProfile), and authMode/authEnv declare only this profile's carrier
+// credential. authMode must be "oauth" or "api_key"; authEnv must declare at
+// least one key (auth material is the entire point of this path).
+func AddProfileWithAuth(cfg *Config, configPath, email, alias, authMode string, authEnv map[string]string, loginNow bool) error {
+	if err := ValidateAlias(alias); err != nil {
+		return err
+	}
+	if err := ValidateEmail(email); err != nil {
+		return err
+	}
+	if _, exists := cfg.Profiles[alias]; exists {
+		return fmt.Errorf("profile %q already exists in config", alias)
+	}
+	if authMode != "oauth" && authMode != "api_key" {
+		return fmt.Errorf("--auth-mode must be \"oauth\" or \"api_key\", got %q", authMode)
+	}
+	if len(authEnv) == 0 {
+		return fmt.Errorf("--auth-mode requires at least one --auth-env KEY=VALUE")
+	}
+
+	description := fmt.Sprintf("Claude Max — %s", email)
+	block := RenderAuthProfileBlock(alias, email, description, authMode, authEnv)
+	if err := appendProfileBlock(configPath, block); err != nil {
+		return err
+	}
+	fmt.Printf("Added [profiles.%s] to %s (auth mode: %s)\n", alias, ExpandPath(configPath), authMode)
+
+	return finishAddProfile(configPath, alias, email, loginNow)
+}
+
+// finishAddProfile is the shared tail of AddProfile/AddProfileWithAuth: reload
+// config.toml to validate the just-appended block actually parsed, materialize
+// the profile directory, sync MCP servers (legacy manage_mcp mode only --
+// design spec §2's ManageMCPEnabled), install the launcher, and run/print the
+// sign-in step. Identical regardless of which TOML block the caller appended.
+func finishAddProfile(configPath, alias, email string, loginNow bool) error {
 	cfg2, err := LoadConfig(configPath)
 	if err != nil {
 		return fmt.Errorf("config no longer parses after add (check %s): %w", ExpandPath(configPath), err)

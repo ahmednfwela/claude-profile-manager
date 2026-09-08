@@ -41,6 +41,7 @@ func main() {
 	root.AddCommand(whichCmd())
 	root.AddCommand(initCmd())
 	root.AddCommand(doctorCmd())
+	root.AddCommand(syncCmd())
 	root.AddCommand(runCmd())
 	root.AddCommand(handoffCmd())
 	root.AddCommand(cloneCmd())
@@ -356,16 +357,19 @@ func doctorCmd() *cobra.Command {
 			}
 
 			profilesBase := internal.ProfilesBaseDir(configPath)
-			checks := internal.RunDoctor(cfg, profilesBase)
+			checks := internal.RunDoctor(cfg, profilesBase, configPath)
 
 			fmt.Print("cpm doctor\n\n")
 			internal.PrintChecks(checks)
 
 			hasErrors := false
+			hasDrift := false
 			for _, c := range checks {
-				if c.Status == "error" {
+				switch c.Status {
+				case "error":
 					hasErrors = true
-					break
+				case "drift":
+					hasDrift = true
 				}
 			}
 
@@ -375,9 +379,76 @@ func doctorCmd() *cobra.Command {
 				fmt.Println("\nAll checks passed.")
 			}
 
+			// Orphan directories and config.toml/mcpServers drift each
+			// warrant attention before the next `cpm sync --apply` silently
+			// overwrites them (design spec §4: "Exit non-zero on any drift
+			// or orphan"). Deliberately a SEPARATE signal from the
+			// pre-existing hasErrors path above, which this leaves
+			// unchanged (cpm doctor has never exited non-zero for those).
+			if hasDrift {
+				return fmt.Errorf("drift or orphan detected -- see [DRFT] entries above")
+			}
+
 			return nil
 		},
 	}
+}
+
+// syncCmd is `cpm sync` (design spec §4): renders every declared profile's
+// [base]+delta and, for manage_mcp="fleet-render" profiles, applies the
+// fleet repo's staged mcpServers patch. Default is dry-run (mirrors `tofu
+// plan`/`apply` -- rule 1's spirit): --apply must be spelled out explicitly
+// to write. Exit codes: 0 = no diff (or a successful --apply), 1 = a real
+// error, 2 = drift found under --dry-run.
+func syncCmd() *cobra.Command {
+	var profile string
+	var all bool
+	var apply bool
+	var dryRun bool
+
+	cmd := &cobra.Command{
+		Use:   "sync [--profile <name> | --all] [--dry-run | --apply]",
+		Short: "Render [base]+delta into config.toml and apply staged fleet-render patches",
+		Long: "Renders every declared profile's args/env from [base] plus its own delta\n" +
+			"(see the design spec's RenderProfile algorithm), splices the fleet-wide\n" +
+			"[base] table into config.toml from fleet/profiles/base.toml, and -- for any\n" +
+			"profile whose effective manage_mcp mode is \"fleet-render\" -- applies that\n" +
+			"profile's staged mcpServers patch as an additive-only merge.\n\n" +
+			"Default is --dry-run: prints the diff, writes nothing. Pass --apply to write.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !all && profile == "" {
+				return fmt.Errorf("pass --profile <name> or --all")
+			}
+			if apply && dryRun {
+				return fmt.Errorf("--apply and --dry-run are mutually exclusive")
+			}
+
+			cfg, err := internal.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+
+			report, err := internal.RunSync(cfg, configPath, internal.SyncOptions{
+				Profile: profile, All: all, Apply: apply,
+			})
+			if err != nil {
+				return err // cobra -> main() -> os.Exit(1)
+			}
+
+			internal.PrintSyncReport(report, apply)
+
+			if report.HasDrift() && !apply {
+				os.Exit(2)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&profile, "profile", "", "sync only this profile")
+	cmd.Flags().BoolVar(&all, "all", false, "sync every declared profile")
+	cmd.Flags().BoolVar(&apply, "apply", false, "write the computed changes (default is dry-run)")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "explicit dry-run (default behavior when --apply is omitted)")
+	return cmd
 }
 
 func runCmd() *cobra.Command {
@@ -476,7 +547,7 @@ func cloneCmd() *cobra.Command {
 			}
 
 			profilesBase := internal.ProfilesBaseDir(configPath)
-			return internal.CloneProfile(sourceName, targetName, profilesBase, cfg.SourceDir, cfg)
+			return internal.CloneProfile(sourceName, targetName, profilesBase, cfg.SourceDir, configPath, cfg)
 		},
 	}
 }
@@ -734,17 +805,25 @@ func addCmd() *cobra.Command {
 	var from string
 	var fleet bool
 	var login bool
+	var authMode string
+	var authEnvPairs []string
 
 	cmd := &cobra.Command{
 		Use:   "add <email> <alias>",
-		Short: "Add a new Claude account profile (clones a Max template + installs launcher)",
+		Short: "Add a new Claude account profile (composes from [base], or clones a template)",
 		Long: "Add a new Claude account as an isolated profile.\n\n" +
-			"Clones args/env from a Max template (fleet.default_template, or the first\n" +
-			"Max profile, or --from), appends [profiles.<alias>] to config.toml, sets up\n" +
-			"the profile dir + launcher, then runs 'claude auth login --email <email>'\n" +
-			"(interactive TTY only; --login=false or --fleet/SSH just prints it) and\n" +
-			"verifies via 'claude auth status'. Credentials are never copied.\n" +
-			"With --fleet, the account is also added on every peer.",
+			"With --auth-mode oauth|api_key (design spec §3/§4), composes the new profile\n" +
+			"from [base] + a declared [profiles.<alias>.auth] -- pass --auth-env\n" +
+			"KEY=VALUE (repeatable) for the carrier env (e.g. ANTHROPIC_API_KEY=${VAR}).\n" +
+			"This is the schema cpm sync/cpm doctor understand; TemplateProfileName\n" +
+			"selection is not used on this path.\n\n" +
+			"Without --auth-mode, clones args/env from a Max template (the legacy path:\n" +
+			"fleet.default_template, or the first Max profile, or --from).\n\n" +
+			"Either way: appends to config.toml, sets up the profile dir + launcher, then\n" +
+			"runs 'claude auth login --email <email>' (interactive TTY only; --login=false\n" +
+			"or --fleet/SSH just prints it) and verifies via 'claude auth status'.\n" +
+			"Credentials are never copied. --fleet (legacy path only) also adds the\n" +
+			"account on every peer.",
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			email, alias := args[0], args[1]
@@ -753,6 +832,17 @@ func addCmd() *cobra.Command {
 				return err
 			}
 			loginNow := login && isInteractiveTTY()
+
+			if authMode != "" {
+				if fleet {
+					return fmt.Errorf("--auth-mode with --fleet is not yet supported; add locally on each peer for now")
+				}
+				authEnv, err := parseAuthEnvPairs(authEnvPairs)
+				if err != nil {
+					return err
+				}
+				return internal.AddProfileWithAuth(cfg, configPath, email, alias, authMode, authEnv, loginNow)
+			}
 			if fleet {
 				return internal.AddProfileToFleet(cfg, configPath, email, alias, from, loginNow)
 			}
@@ -760,10 +850,26 @@ func addCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&from, "from", "", "template profile to clone args/env from (default: fleet.default_template or first Max profile)")
-	cmd.Flags().BoolVar(&fleet, "fleet", false, "also add this account on every configured fleet peer over SSH")
+	cmd.Flags().StringVar(&from, "from", "", "template profile to clone args/env from (legacy path; default: fleet.default_template or first Max profile)")
+	cmd.Flags().BoolVar(&fleet, "fleet", false, "also add this account on every configured fleet peer over SSH (legacy --from path only)")
 	cmd.Flags().BoolVar(&login, "login", true, "run 'claude auth login' after add when stdin is a TTY (--login=false to skip; auto-skipped under --fleet/SSH)")
+	cmd.Flags().StringVar(&authMode, "auth-mode", "", "compose from [base]+auth instead of cloning a template: \"oauth\" or \"api_key\"")
+	cmd.Flags().StringArrayVar(&authEnvPairs, "auth-env", nil, "KEY=VALUE for the profile's [auth.env] (repeatable; requires --auth-mode)")
 	return cmd
+}
+
+// parseAuthEnvPairs turns repeated --auth-env KEY=VALUE flags into a map, for
+// AddProfileWithAuth's authEnv parameter.
+func parseAuthEnvPairs(pairs []string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, p := range pairs {
+		k, v, ok := strings.Cut(p, "=")
+		if !ok || k == "" {
+			return nil, fmt.Errorf("--auth-env %q: want KEY=VALUE", p)
+		}
+		out[k] = v
+	}
+	return out, nil
 }
 
 // isInteractiveTTY reports whether stdin is a terminal, so an interactive browser
