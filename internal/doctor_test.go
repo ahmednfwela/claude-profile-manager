@@ -185,7 +185,7 @@ func TestRunDoctorBaseLocalModificationFlag(t *testing.T) {
 	dir := t.TempDir()
 	repo := filepath.Join(dir, "fleet-repo")
 	os.MkdirAll(filepath.Join(repo, "profiles"), 0o755)
-	os.WriteFile(filepath.Join(repo, "profiles", "base.toml"), []byte(`model = "sonnet"`), 0o644)
+	os.WriteFile(filepath.Join(repo, "profiles", "base.toml"), []byte(minimalBaseBlock), 0o644)
 
 	sourceDir := filepath.Join(dir, "source")
 	os.MkdirAll(sourceDir, 0o755)
@@ -228,7 +228,7 @@ func TestRunDoctorNoBaseDriftWhenInSync(t *testing.T) {
 	dir := t.TempDir()
 	repo := filepath.Join(dir, "fleet-repo")
 	os.MkdirAll(filepath.Join(repo, "profiles"), 0o755)
-	os.WriteFile(filepath.Join(repo, "profiles", "base.toml"), []byte(`model = "sonnet"`), 0o644)
+	os.WriteFile(filepath.Join(repo, "profiles", "base.toml"), []byte(minimalBaseBlock), 0o644)
 
 	sourceDir := filepath.Join(dir, "source")
 	os.MkdirAll(sourceDir, 0o755)
@@ -238,7 +238,7 @@ func TestRunDoctorNoBaseDriftWhenInSync(t *testing.T) {
 	configPath := filepath.Join(dir, "config.toml")
 	content := "source_dir = " + tomlValue(sourceDir) + "\n" +
 		"[fleet]\nrepo_path = " + tomlValue(repo) + "\n\n" +
-		RenderBaseBlock(&Base{Model: "sonnet"}) + "\n" +
+		RenderBaseBlock(minimalBaseBlock) + "\n" +
 		"[profiles.p]\ndescription = \"p\"\n"
 	os.WriteFile(configPath, []byte(content), 0o644)
 

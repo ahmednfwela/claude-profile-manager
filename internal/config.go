@@ -53,32 +53,53 @@ type ProfileAuth struct {
 }
 
 // Base is the fleet-wide [base] table (design spec §3): the args/env common
-// to every profile on a machine, rendered verbatim from fleet/profiles/
-// base.toml by `cpm sync` (see RenderBaseBlock/SpliceBase). Model/Args are
-// the fleet-wide defaults a profile may override (Profile.Model) or extend
-// (Profile.Args); Env holds BOTH the flat common entries and any per-GOOS
-// overlay subtables -- see BaseEnvCommon/BaseEnvOverlay for why they need to
-// be read apart rather than declared as two separate TOML keys.
+// to every profile on a machine, spliced VERBATIM from fleet/profiles/
+// base.toml by `cpm sync` (see LoadFleetBase/RenderBaseBlock/SpliceBase), so
+// its shape is that file's shape -- the one the fleet's own fleet-doctor F10
+// check also grades a device's config.toml against:
+//
+//	[base]
+//	model = ""
+//	args = ["--dangerously-skip-permissions", "...", "~/.claude-profiles/lane-authority.md"]
+//	[base.env]
+//	KEY = "value"
+//	os_overlay = { windows = { KEY = "v" }, darwin = {} }
+//
+// Model/Args are the fleet-wide defaults a profile may override
+// (Profile.Model) or extend (Profile.Args). The per-GOOS overlay is the
+// `os_overlay` INLINE TABLE under [base.env], keyed by Go's runtime.GOOS
+// names -- not [base.env.<goos>] subtable headers, which the fleet's own
+// TOML reader cannot parse (base.toml FORMAT NOTE 2) and which F10 would
+// therefore never see. Unknown keys such as base.toml's `description_prefix`
+// are tolerated (BurntSushi/toml ignores undecoded keys) so the block can
+// stay byte-for-byte what the fleet ships. `~/...` values are placeholders;
+// ResolveRendered turns them into this machine's paths at render time.
 type Base struct {
 	Model string   `toml:"model"`
 	Args  []string `toml:"args"`
 	// Env decodes [base.env]'s table as map[string]any (not map[string]string)
-	// because BurntSushi/toml would otherwise reject the [base.env.<goos>]
-	// overlay subtables it also lives under as a type mismatch (a subtable
-	// value where a plain string is expected). Read it through
-	// BaseEnvCommon/BaseEnvOverlay, never directly.
+	// because the os_overlay inline table lives inside it and BurntSushi/toml
+	// would otherwise reject that table value as a type mismatch. Read it
+	// through BaseEnvCommon/BaseEnvOverlay, never directly.
 	Env map[string]any `toml:"env"`
 }
 
-// BaseEnvCommon returns [base.env]'s flat string entries, excluding any
-// nested per-GOOS overlay subtables (see BaseEnvOverlay for those). Safe to
-// call on a nil *Base.
+// baseEnvOverlayKey is the [base.env] key holding the per-GOOS overlay
+// inline table: `os_overlay = { windows = {...}, darwin = {...} }`.
+const baseEnvOverlayKey = "os_overlay"
+
+// BaseEnvCommon returns [base.env]'s flat string entries, excluding the
+// os_overlay table (see BaseEnvOverlay for that) and any other non-string
+// value. Safe to call on a nil *Base.
 func (b *Base) BaseEnvCommon() map[string]string {
 	out := map[string]string{}
 	if b == nil {
 		return out
 	}
 	for k, v := range b.Env {
+		if k == baseEnvOverlayKey {
+			continue
+		}
 		if s, ok := v.(string); ok {
 			out[k] = s
 		}
@@ -86,7 +107,7 @@ func (b *Base) BaseEnvCommon() map[string]string {
 	return out
 }
 
-// BaseEnvOverlay returns the [base.env.<goos>] overlay table for the given
+// BaseEnvOverlay returns the [base.env] os_overlay.<goos> table for the given
 // GOOS name (e.g. "windows", "darwin", "linux"), or an empty map if this Base
 // declares no overlay for it. Safe to call on a nil *Base.
 func (b *Base) BaseEnvOverlay(goos string) map[string]string {
@@ -94,11 +115,11 @@ func (b *Base) BaseEnvOverlay(goos string) map[string]string {
 	if b == nil {
 		return out
 	}
-	raw, ok := b.Env[goos]
+	overlays, ok := b.Env[baseEnvOverlayKey].(map[string]any)
 	if !ok {
 		return out
 	}
-	m, ok := raw.(map[string]any)
+	m, ok := overlays[goos].(map[string]any)
 	if !ok {
 		return out
 	}

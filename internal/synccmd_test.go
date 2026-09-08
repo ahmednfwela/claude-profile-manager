@@ -38,13 +38,11 @@ func writeFleetRepoFixture(t *testing.T, dir, device, profile, baseTOML, mcpPatc
 // `cpm sync --all --dry-run` -- and must not write anything.
 func TestRunSyncDryRunGoldenDiff(t *testing.T) {
 	dir := t.TempDir()
-	repo := writeFleetRepoFixture(t, dir, "test-device", "alibaba1",
-		`model = "sonnet"
-args = ["--dangerously-skip-permissions"]
-
-[env]
-ENABLE_TOOL_SEARCH = "true"
-`, "")
+	// The fleet's own shape ([base] wrapper, [base.env]) -- the SAME bytes
+	// must come back out of RenderBaseBlock, so the golden expectation below
+	// is built from this very constant.
+	const goldenBase = "[base]\nmodel = \"sonnet\"\nargs = [\"--dangerously-skip-permissions\"]\n\n[base.env]\nENABLE_TOOL_SEARCH = \"true\"\n"
+	repo := writeFleetRepoFixture(t, dir, "test-device", "alibaba1", goldenBase, "")
 
 	configPath := filepath.Join(dir, "config.toml")
 	original := "source_dir = \"~/.claude\"\n\n" +
@@ -74,11 +72,7 @@ ENABLE_TOOL_SEARCH = "true"
 	if report.BaseDiff == nil {
 		t.Fatal("expected a [base] diff (fixture base.toml differs from the live OLD-MODEL block)")
 	}
-	wantAfter := strings.TrimRight(RenderBaseBlock(&Base{
-		Model: "sonnet",
-		Args:  []string{"--dangerously-skip-permissions"},
-		Env:   map[string]any{"ENABLE_TOOL_SEARCH": "true"},
-	}), "\n")
+	wantAfter := strings.TrimRight(RenderBaseBlock(goldenBase), "\n")
 	if report.BaseDiff.After != wantAfter {
 		t.Errorf("BaseDiff.After = %q, want %q", report.BaseDiff.After, wantAfter)
 	}
@@ -101,12 +95,11 @@ ENABLE_TOOL_SEARCH = "true"
 
 func TestRunSyncNoDriftWhenAlreadyInSync(t *testing.T) {
 	dir := t.TempDir()
-	base := &Base{Model: "sonnet"}
-	repo := writeFleetRepoFixture(t, dir, "test-device", "bdaya", `model = "sonnet"`, "")
+	repo := writeFleetRepoFixture(t, dir, "test-device", "bdaya", minimalBaseBlock, "")
 
 	configPath := filepath.Join(dir, "config.toml")
 	content := "[fleet]\nrepo_path = " + tomlValue(repo) + "\n\n" +
-		RenderBaseBlock(base) + "\n" +
+		RenderBaseBlock(minimalBaseBlock) + "\n" +
 		"[profiles.bdaya]\ndescription = \"bdaya\"\n"
 	if err := os.WriteFile(configPath, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -125,9 +118,80 @@ func TestRunSyncNoDriftWhenAlreadyInSync(t *testing.T) {
 	}
 }
 
+// v0.6.0 decoded the real fleet base.toml to an empty table and rendered an
+// empty [base] without a word. The bare top-level shape it expected must now
+// surface as a RunSync ERROR, not a diff and not a quiet no-op.
+func TestRunSyncRejectsBareTopLevelBaseTOML(t *testing.T) {
+	dir := t.TempDir()
+	repo := writeFleetRepoFixture(t, dir, "test-device", "bdaya", "model = \"sonnet\"\nargs = [\"--x\"]\n", "")
+	configPath := filepath.Join(dir, "config.toml")
+	content := "[fleet]\nrepo_path = " + tomlValue(repo) + "\n\n[profiles.bdaya]\ndescription = \"bdaya\"\n"
+	if err := os.WriteFile(configPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RunSync(cfg, configPath, SyncOptions{All: true, GOOS: "linux"}); err == nil {
+		t.Fatal("RunSync must refuse a base.toml without a [base] header instead of rendering an empty table")
+	}
+}
+
+// A sync with nothing to read from is reported, never passed off as
+// "everything already in sync" (the v0.6.0 first-run experience).
+func TestRunSyncWarnsWhenRepoPathUnset(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[profiles.bdaya]\ndescription = \"bdaya\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := RunSync(cfg, configPath, SyncOptions{All: true, GOOS: "linux"})
+	if err != nil {
+		t.Fatalf("RunSync: %v", err)
+	}
+	if report.HasDrift() {
+		t.Error("no repo_path means nothing to diff -- HasDrift must be false")
+	}
+	if len(report.Warnings) != 1 || !strings.Contains(report.Warnings[0], "repo_path") {
+		t.Errorf("Warnings = %v, want exactly one naming repo_path", report.Warnings)
+	}
+}
+
+func TestRunSyncWarnsWhenBaseTOMLMissing(t *testing.T) {
+	dir := t.TempDir()
+	emptyRepo := filepath.Join(dir, "fleet-repo-without-base")
+	if err := os.MkdirAll(emptyRepo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.toml")
+	content := "[fleet]\nrepo_path = " + tomlValue(emptyRepo) + "\n\n[profiles.bdaya]\ndescription = \"bdaya\"\n"
+	if err := os.WriteFile(configPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := RunSync(cfg, configPath, SyncOptions{All: true, GOOS: "linux"})
+	if err != nil {
+		t.Fatalf("RunSync: %v", err)
+	}
+	if report.HasDrift() {
+		t.Error("a missing base.toml is not drift")
+	}
+	if len(report.Warnings) != 1 || !strings.Contains(report.Warnings[0], "base.toml") {
+		t.Errorf("Warnings = %v, want exactly one naming base.toml", report.Warnings)
+	}
+}
+
 func TestRunSyncApplyWritesSpliceAndIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	repo := writeFleetRepoFixture(t, dir, "test-device", "bdaya", `model = "sonnet"`, "")
+	repo := writeFleetRepoFixture(t, dir, "test-device", "bdaya", minimalBaseBlock, "")
 
 	configPath := filepath.Join(dir, "config.toml")
 	original := "[fleet]\nrepo_path = " + tomlValue(repo) + "\n\n" +
@@ -180,7 +244,7 @@ func TestRunSyncApplyWritesSpliceAndIsIdempotent(t *testing.T) {
 func TestRunSyncApplyMCPServersPreservesChannelInstallEntry(t *testing.T) {
 	dir := t.TempDir()
 	repo := writeFleetRepoFixture(t, dir, "test-device", "alibaba1",
-		`model = "sonnet"`,
+		minimalBaseBlock,
 		`{"socraticode":{"type":"http","url":"http://127.0.0.1:9999/mcp"}}`)
 
 	configPath := filepath.Join(dir, "config.toml")

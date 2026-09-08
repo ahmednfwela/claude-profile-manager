@@ -1,6 +1,10 @@
 package internal
 
-import "fmt"
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+)
 
 // RenderedProfile is RenderProfile's pure output: the effective args/env/model
 // for a profile after merging [base] (+ its per-GOOS overlay), the profile's
@@ -17,13 +21,15 @@ type RenderedProfile struct {
 //	effective_args  = base.args ++ profile.args
 //	                ++ ["--model", effective_model]  (only if effective_model != "")
 //	effective_env   = base.env
-//	                ⊕ base.env.<goos>       (right-biased)
-//	                ⊕ profile.auth.env      (the ONLY place auth material enters)
-//	                ⊕ profile.env           (declared delta)
+//	                ⊕ base.env.os_overlay.<goos>   (right-biased)
+//	                ⊕ profile.auth.env             (the ONLY place auth material enters)
+//	                ⊕ profile.env                  (declared delta)
 //
-// goos selects the [base.env.<goos>] overlay (pass runtime.GOOS in production
+// goos selects the os_overlay.<goos> overlay (pass runtime.GOOS in production
 // code; a literal string in tests) so this stays a pure, filesystem-free,
-// cross-platform-testable function -- no global state, no I/O.
+// cross-platform-testable function -- no global state, no I/O. The output
+// still carries base.toml's `~/...` placeholders verbatim; ResolveRendered
+// turns them into this machine's paths.
 //
 // Returns an error if cfg has no such profile, or if a key is declared in
 // BOTH profile.auth.env and profile.env: auth keys are reserved, and a
@@ -87,4 +93,78 @@ func RenderProfile(cfg *Config, name, goos string) (RenderedProfile, error) {
 	}
 
 	return RenderedProfile{Args: args, Env: env, Model: effectiveModel}, nil
+}
+
+// RenderOptions carries the two machine-specific inputs ResolveRendered
+// needs. They are injected rather than read from the OS so RenderProfile +
+// ResolveRendered stay pure and cross-platform-testable; production callers
+// pass os.UserHomeDir() and an os.Stat-backed FileExists.
+type RenderOptions struct {
+	Home       string
+	FileExists func(path string) bool
+}
+
+// appendSystemPromptFlag is the claude flag whose file operand base.toml
+// declares as a `~/...` placeholder (the owner-written lane-authority grant).
+const appendSystemPromptFlag = "--append-system-prompt-file"
+
+// ResolveRendered applies fleet/profiles/base.toml's placeholder contract
+// (that file's own PLACEHOLDERS section) to a rendered profile, producing the
+// values this machine can actually execute:
+//
+//   - every arg and env value beginning with "~/" gets the "~" replaced by
+//     opts.Home, forward-slashed ("C:/Users/<u>/..." on Windows), matching
+//     how onboard renders the same paths into a first-enrolled config.toml;
+//   - an "--append-system-prompt-file <path>" pair (or its "=<path>" form)
+//     whose resolved path does not exist is dropped entirely: claude fails
+//     hard on a missing prompt file, and that grant file is owner-written,
+//     so a machine without it must launch without the flag rather than not
+//     launch at all -- the same safety net onboard/lib/steps/profiles.js
+//     already enforces at enrollment.
+//
+// The [base] table itself is never resolved (RenderBaseBlock keeps it
+// verbatim so fleet-doctor F10 can compare it to base.toml); resolution is
+// a per-machine, per-launch concern and lives here only.
+func ResolveRendered(rp RenderedProfile, opts RenderOptions) RenderedProfile {
+	exists := opts.FileExists
+	if exists == nil {
+		exists = func(string) bool { return true }
+	}
+	out := RenderedProfile{
+		Model: rp.Model,
+		Args:  make([]string, 0, len(rp.Args)),
+		Env:   make(map[string]string, len(rp.Env)),
+	}
+	for k, v := range rp.Env {
+		out.Env[k] = expandHomePlaceholder(v, opts.Home)
+	}
+	for i := 0; i < len(rp.Args); i++ {
+		a := rp.Args[i]
+		switch {
+		case a == appendSystemPromptFlag && i+1 < len(rp.Args):
+			p := expandHomePlaceholder(rp.Args[i+1], opts.Home)
+			i++ // the operand is consumed with its flag, kept or dropped together
+			if exists(p) {
+				out.Args = append(out.Args, a, p)
+			}
+		case strings.HasPrefix(a, appendSystemPromptFlag+"="):
+			p := expandHomePlaceholder(strings.TrimPrefix(a, appendSystemPromptFlag+"="), opts.Home)
+			if exists(p) {
+				out.Args = append(out.Args, appendSystemPromptFlag+"="+p)
+			}
+		default:
+			out.Args = append(out.Args, expandHomePlaceholder(a, opts.Home))
+		}
+	}
+	return out
+}
+
+// expandHomePlaceholder replaces a leading "~/" with home (forward-slashed,
+// no trailing slash); any other value is returned unchanged. An empty home
+// leaves the placeholder alone rather than producing a path rooted at "/".
+func expandHomePlaceholder(v, home string) string {
+	if home == "" || !strings.HasPrefix(v, "~/") {
+		return v
+	}
+	return strings.TrimRight(filepath.ToSlash(home), "/") + v[1:]
 }

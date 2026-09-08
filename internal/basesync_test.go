@@ -1,36 +1,57 @@
 package internal
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestRenderBaseBlockDeterministicAndSorted(t *testing.T) {
-	b := &Base{
-		Model: "sonnet",
-		Args:  []string{"--dangerously-skip-permissions", "--effort", "ultracode"},
-		Env: map[string]any{
-			"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "128000",
-			"ENABLE_TOOL_SEARCH":            "true",
-			"windows": map[string]any{
-				"CLAUDE_CODE_USE_POWERSHELL_TOOL": "1",
-			},
-			"darwin": map[string]any{},
-		},
+// minimalBaseBlock is the smallest fleet-shaped [base] table the sync/doctor
+// fixtures below share between "what base.toml says" and "what config.toml
+// should hold" -- the two must be the SAME bytes for no-drift to be true.
+const minimalBaseBlock = "[base]\nmodel = \"sonnet\""
+
+// RenderBaseBlock is a verbatim wrapper: what fleet/profiles/base.toml says
+// is what config.toml's [base] says -- key spellings, `~/` placeholders and
+// the os_overlay inline table included -- because fleet-doctor F10 compares
+// the two files key for key.
+func TestRenderBaseBlockIsVerbatim(t *testing.T) {
+	block := "[base]\n" +
+		"description_prefix = \"Claude Max\"\n" +
+		"model = \"\"\n" +
+		"args = [\"--dangerously-skip-permissions\", \"~/.claude-profiles/lane-authority.md\"]\n" +
+		"[base.env]\n" +
+		"ENABLE_TOOL_SEARCH = \"true\"\n" +
+		"os_overlay = { windows = { CLAUDE_CODE_USE_POWERSHELL_TOOL = \"1\" }, darwin = {} }\n"
+	got := RenderBaseBlock(block)
+	want := baseSentinelBeginLine + "\n" + strings.TrimRight(block, "\n") + "\n" + baseSentinelEndLine + "\n"
+	if got != want {
+		t.Fatalf("RenderBaseBlock rewrote its input:\n--- got\n%s\n--- want\n%s", got, want)
 	}
-	block := RenderBaseBlock(b)
-	again := RenderBaseBlock(b)
-	if block != again {
-		t.Fatalf("RenderBaseBlock is not deterministic:\n---first---\n%s\n---second---\n%s", block, again)
+	if RenderBaseBlock(block) != got || RenderBaseBlock(block+"\n\n") != got {
+		t.Error("RenderBaseBlock must be deterministic and trailing-whitespace-insensitive")
 	}
-	for _, want := range []string{"[base]", `model = "sonnet"`, "[base.env]", "[base.env.windows]"} {
-		if !strings.Contains(block, want) {
-			t.Errorf("rendered block missing %q:\n%s", want, block)
-		}
+
+	// cpm's own config loader must read the spliced block back with the
+	// overlay intact and the unknown description_prefix tolerated -- the
+	// shape is shared with the fleet, not private to cpm.
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfgPath, []byte(got+"\n[profiles.p]\ndescription = \"p\"\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	// darwin overlay is empty -- must not render an empty [base.env.darwin] section.
-	if strings.Contains(block, "[base.env.darwin]") {
-		t.Errorf("empty darwin overlay should not render a section header:\n%s", block)
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig on a spliced block: %v", err)
+	}
+	if cfg.Base == nil || cfg.Base.BaseEnvOverlay("windows")["CLAUDE_CODE_USE_POWERSHELL_TOOL"] != "1" {
+		t.Errorf("spliced [base] did not round-trip through LoadConfig: %+v", cfg.Base)
+	}
+	if common := cfg.Base.BaseEnvCommon(); common["ENABLE_TOOL_SEARCH"] != "true" || len(common) != 1 {
+		t.Errorf("BaseEnvCommon after round-trip = %v (os_overlay must not leak as a flat key)", common)
+	}
+	if len(cfg.Base.Args) != 2 || cfg.Base.Args[1] != "~/.claude-profiles/lane-authority.md" {
+		t.Errorf("Args after round-trip = %v (placeholder must stay verbatim in [base])", cfg.Base.Args)
 	}
 }
 
@@ -53,8 +74,7 @@ func TestSpliceBasePreservesBytesOutsideSentinels(t *testing.T) {
 		"[profiles.bdaya.auth]\n" +
 		"mode = \"oauth\"\n"
 
-	newBase := &Base{Model: "sonnet"}
-	rendered := RenderBaseBlock(newBase)
+	rendered := RenderBaseBlock(minimalBaseBlock)
 
 	spliced, changed, err := SpliceBase(original, rendered)
 	if err != nil {
@@ -104,7 +124,7 @@ func TestSpliceBasePreservesBytesOutsideSentinels(t *testing.T) {
 
 func TestSpliceBaseAppendsWhenNoSentinelsPresent(t *testing.T) {
 	original := "source_dir = \"~/.claude\"\n\n[profiles.bdaya]\ndescription = \"x\"\n"
-	rendered := RenderBaseBlock(&Base{Model: "sonnet"})
+	rendered := RenderBaseBlock(minimalBaseBlock)
 
 	spliced, changed, err := SpliceBase(original, rendered)
 	if err != nil {
@@ -122,7 +142,7 @@ func TestSpliceBaseAppendsWhenNoSentinelsPresent(t *testing.T) {
 }
 
 func TestExtractBaseRoundTrip(t *testing.T) {
-	rendered := RenderBaseBlock(&Base{Model: "sonnet"})
+	rendered := RenderBaseBlock(minimalBaseBlock)
 	content := "x = 1\n" + rendered + "\ny = 2\n"
 
 	got, ok := ExtractBase(content)

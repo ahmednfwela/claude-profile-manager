@@ -1,0 +1,128 @@
+# fleet/profiles/base.toml -- the single generator for cpm config.toml's
+# [base] table (shared/claude-plugins cpm-unification design, work item B;
+# spec: cpm-unification-spec.md §2/§3/§7B). GIT-TRACKED, HUMAN/PR-OWNED --
+# this is content, never a per-machine value.
+#
+# Read by:
+#   - onboard/lib/steps/profiles.js `renderConfigToml`, at first-ever
+#     enrollment -- sources a NEW machine's per-profile args/env from here
+#     instead of hand-rendering them, substituting the two `~/...`
+#     placeholders below against THAT machine's own absolute paths (today's
+#     cpm binary understands only fully-rendered per-profile
+#     [profiles.<n>].args / [profiles.<n>.env], not a [base] table -- see that
+#     file's own comment on `renderConfigToml` for why the OUTPUT SHAPE stays
+#     flattened even though the SOURCE is now this file).
+#   - cpm's own `cpm sync` (work item A, not yet landed) -- verbatim, via the
+#     sentinel-splice write mechanism the design spec's §2 describes, once
+#     that binary ships and a machine's config.toml is migrated to carry a
+#     real [base] table.
+#   - fleet-doctor.mjs's F10 check -- read-only, comparing a live config.toml's
+#     [base]/delta against this file.
+#
+# PLACEHOLDERS. Two `~/...` strings below are TEMPLATE TEXT, not a path that
+# exists on the machine authoring this file -- each reader resolves them
+# against ITS OWN machine before use:
+#   "~/.claude-profiles/lane-authority.md"  the owner's standing lane-
+#                                            authority grant (see
+#                                            onboard/lib/steps/profiles.js's
+#                                            file-header for why this package
+#                                            will never WRITE that file, only
+#                                            reference it). onboard drops both
+#                                            `--append-system-prompt-file` and
+#                                            this path from the rendered args
+#                                            entirely when the grant file does
+#                                            not exist yet on that machine --
+#                                            the same safety net the pre-work-
+#                                            item-B code already enforced.
+#   "~/.claude/plugins"                     the machine-shared plugin/
+#                                            marketplace cache root
+#                                            (cfg.pluginsRoot in
+#                                            onboard/lib/config.js). NOTE: an
+#                                            earlier DRAFT of the design spec
+#                                            used "~/.claude/plugin-cache"
+#                                            here -- that value was never
+#                                            verified against the live
+#                                            estate and disagrees with the
+#                                            ACTUAL, live value of this key
+#                                            (onboard/lib/steps/profiles.js,
+#                                            pre-this-change:
+#                                            `CLAUDE_CODE_PLUGIN_CACHE_DIR =
+#                                            lit(cfg.pluginsRoot)`, i.e.
+#                                            "~/.claude/plugins"). This file
+#                                            uses the verified one; see the
+#                                            MR description for this
+#                                            deviation from the draft spec
+#                                            text.
+#
+# NEITHER SUBSTITUTION IS A GENERAL `~`-EXPANSION -- cpm's own eventual
+# "resolve `~` via os.UserHomeDir() everywhere" question is explicitly still
+# open (design spec §6 / §8 step 1b / the open-questions list); this file
+# defines exactly these two literal tokens and nothing else.
+#
+# FORMAT NOTE 1: `args` is a SINGLE LINE, deliberately. This tree's own TOML
+# reader (fleet/converge/lib/toml-mini.mjs) is a declared subset that THROWS
+# on a multi-line array (`MULTILINE_ARRAY` -- see that file's own header, and
+# subagent-model.mjs's S1 comment on the exact same constraint for config.toml
+# itself). Wrapping this array across lines for readability would make it
+# unreadable by the reader everyone else in this tree already uses -- the
+# "two half-overlapping implementations" shape the design spec's own §2
+# explicitly rejects.
+#
+# FORMAT NOTE 2, DISCOVERED WHILE WRITING THIS FILE (not part of the design
+# spec -- flag for a follow-up against toml-mini.mjs itself, out of scope for
+# this MR): `parseToml`'s cursor-tracking for a DOTTED table header
+# (`[a.b]`/`[a.b.c]`) never updates `cursorKeys` on the "descend into the
+# parent's own last element" branch (`parseToml`'s special-case check
+# `keys[0] === cursorKeys[cursorKeys.length - 1]`, added for `[[a]]` ->
+# `[a.b]` array-of-table sub-tables). That branch happens to also fire for a
+# PLAIN table transition like `[base]` -> `[base.env]` (first segment 'base'
+# matches the 1-element cursor's last segment 'base'), and because it never
+# refreshes `cursorKeys`, a SECOND such transition immediately after
+# (`[base.env]` -> `[base.env.windows]`) mis-slices the header's own segments
+# and nests an extra, wrong "env" table
+# (verified live: `[base]`+`[base.env]`+`[base.env.windows]`+
+# `[base.env.darwin]` parses to `base.env.env.windows.env.darwin`, not
+# `base.env.windows` / `base.env.darwin`). Worked around here by using ONE
+# inline-table assignment (`os_overlay = {...}`, below) instead of nested
+# `[base.env.<os>]` headers -- inline-table values are parsed by
+# `parseValue`'s own recursive `setPath` calls into a fresh local object, not
+# by the header cursor-tracking state, so they are not exposed to this bug.
+
+[base]
+description_prefix = "Claude Max"
+# Fleet-wide default --model pin. Empty = no injected flag. See RenderProfile's
+# Model handling (design spec §3 / §11 item 6) -- shared/claude-plugins#598 is
+# why this stays empty: a `model` pin here would silently outrank a caller's
+# own --model argument on every dispatch that omits one, which is the exact
+# incident #598 exists to prevent. `fleet/profiles.toml`'s own `bdaya` entry
+# documents the same ruling from the profiles-declaration side.
+model = ""
+args = ["--dangerously-skip-permissions", "--effort", "ultracode", "--channels=plugin:bdaya-defaults@bdaya", "--append-system-prompt-file", "~/.claude-profiles/lane-authority.md"]
+
+[base.env]
+ENABLE_TOOL_SEARCH = "true"
+CLAUDE_CODE_MAX_OUTPUT_TOKENS = "128000"
+# One plugin+marketplace root shared by ALL profiles -- a per-profile cache
+# would re-download every plugin six times and let the six drift apart
+# (onboard/lib/steps/profiles.js's own comment on this exact key, unchanged by
+# this move). See the placeholder note above the [base] header for why this is
+# "~/.claude/plugins" and not the earlier draft spec's unverified
+# "~/.claude/plugin-cache".
+CLAUDE_CODE_PLUGIN_CACHE_DIR = "~/.claude/plugins"
+
+# CLAUDE_CODE_SUBAGENT_MODEL is declared PER-PROFILE, deliberately NOT here.
+# fleet-doctor.mjs's S1 check (shared/claude-plugins#526/#682, the #506 class)
+# reads that key scoped to `[profiles.<alias>.env]` only -- moving it into
+# this table would make S1 fail fleet-wide the moment a profile's config.toml
+# stopped carrying the per-profile literal. See fleet-doctor.mjs's F10 comment
+# (the check that reads this file) for the full account, and the design
+# spec's §3 [base.env] callout for the original analysis.
+
+# Per-OS overlay, keyed by Go's own runtime.GOOS names (cpm is Go) -- NOT this
+# estate's usual device vocabulary ("macos"; see device.doc.os elsewhere in
+# this tree). fleet-doctor.mjs's F10 check and onboard's renderConfigToml both
+# map their own OS name to this key explicitly (windows->windows,
+# macos->darwin, linux->linux) rather than assuming the two vocabularies
+# coincide. See FORMAT NOTE 2 above for why this is one inline-table
+# assignment rather than `[base.env.windows]` / `[base.env.darwin]` headers.
+os_overlay = { windows = { CLAUDE_CODE_USE_POWERSHELL_TOOL = "1" }, darwin = {} }
