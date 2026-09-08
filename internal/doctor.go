@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"time"
 )
 
@@ -16,7 +17,14 @@ type Check struct {
 	Detail string
 }
 
-func RunDoctor(cfg *Config, profilesBase string) []Check {
+// RunDoctor diagnoses profile/config issues. configPath enables the two
+// config.toml-aware checks added by the design spec's work item (A) --
+// orphan-directory scan and the [base] local-modification flag -- both of
+// which need to read config.toml's raw text and (for the [base] check) the
+// fleet-repo checkout it points at. Pass "" to skip those two checks
+// entirely (e.g. from a caller that only has an in-memory *Config, no file
+// on disk) -- every other check runs exactly as before.
+func RunDoctor(cfg *Config, profilesBase, configPath string) []Check {
 	var checks []Check
 
 	// Check claude binary
@@ -107,6 +115,84 @@ func RunDoctor(cfg *Config, profilesBase string) []Check {
 		}
 	}
 
+	checks = append(checks, orphanDirectoryChecks(cfg, profilesBase)...)
+	checks = append(checks, syncDriftChecks(cfg, configPath)...)
+
+	return checks
+}
+
+// orphanDirectoryChecks scans profilesBase for a directory with no matching
+// [profiles.*] key in cfg (design spec §4). Reported and NEVER touched -- no
+// auto-delete, no auto-adopt, ever: this defends against the "digrum "
+// trailing-space incident class (a mistyped CLAUDE_CONFIG_DIR that no
+// existing command lists, so it stays invisible until scanned for), and
+// deliberately does not require configPath -- it works from cfg.Profiles and
+// the live directory listing alone.
+func orphanDirectoryChecks(cfg *Config, profilesBase string) []Check {
+	entries, err := os.ReadDir(profilesBase)
+	if err != nil {
+		return nil
+	}
+	var orphanNames []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, registered := cfg.Profiles[e.Name()]; registered {
+			continue
+		}
+		orphanNames = append(orphanNames, e.Name())
+	}
+	sort.Strings(orphanNames)
+
+	checks := make([]Check, 0, len(orphanNames))
+	for _, name := range orphanNames {
+		checks = append(checks, Check{
+			Name:   fmt.Sprintf("profile-orphan/%s", name),
+			Status: "drift",
+			Detail: fmt.Sprintf("ORPHAN (not in config.toml, NEVER touched): %s", filepath.Join(profilesBase, name)),
+		})
+	}
+	return checks
+}
+
+// syncDriftChecks reuses `cpm sync`'s own dry-run diff engine (RunSync) to
+// report the [base] local-modification flag and any per-profile drift
+// (design spec §4, items 2-3) -- deliberately the SAME computation `cpm
+// sync --dry-run` uses, so doctor and sync can never disagree about what
+// counts as "in sync". Returns nil when configPath is "" (an in-memory-only
+// *Config with no file on disk to diff against) rather than erroring --
+// every other doctor check still runs.
+func syncDriftChecks(cfg *Config, configPath string) []Check {
+	if configPath == "" {
+		return nil
+	}
+	report, err := RunSync(cfg, configPath, SyncOptions{All: true, GOOS: runtime.GOOS})
+	if err != nil {
+		// A config.toml predating this feature (no [fleet].repo_path, no
+		// [base]) is a valid quiet state inside RunSync itself; an error
+		// here means something else is actually wrong (e.g. configPath no
+		// longer readable) and is worth a check entry, not a silent skip.
+		return []Check{{Name: "sync-drift", Status: "warn", Detail: fmt.Sprintf("could not compute sync drift: %v", err)}}
+	}
+
+	var checks []Check
+	if report.BaseDiff != nil {
+		checks = append(checks, Check{
+			Name:   "config.toml [base]",
+			Status: "drift",
+			Detail: "local [base] differs from fleet/profiles/base.toml -- will be overwritten on the next `cpm sync --apply` (run `cpm sync --dry-run` to see the diff)",
+		})
+	}
+	for _, p := range report.Profiles {
+		for _, d := range p.Diffs {
+			checks = append(checks, Check{
+				Name:   fmt.Sprintf("profile/%s/%s", p.Profile, d.File),
+				Status: "drift",
+				Detail: fmt.Sprintf("drift detected (run `cpm sync --dry-run --profile %s` to see the diff)", p.Profile),
+			})
+		}
+	}
 	return checks
 }
 
@@ -120,6 +206,8 @@ func PrintChecks(checks []Check) {
 			icon = "WARN"
 		case "error":
 			icon = " ERR"
+		case "drift":
+			icon = "DRFT"
 		}
 		fmt.Printf("  [%s] %-35s %s\n", icon, c.Name, c.Detail)
 	}

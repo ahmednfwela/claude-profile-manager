@@ -89,6 +89,60 @@ func TestRenderProfileBlockRoundTrip(t *testing.T) {
 	}
 }
 
+// --- cpm-unification: cpm add --auth-mode (design spec §3/§4) -------------
+
+func TestRenderAuthProfileBlockRoundTrip(t *testing.T) {
+	authEnv := map[string]string{
+		"ANTHROPIC_BASE_URL": "${BDAYA_ALIBABA_BASE_URL}",
+		"ANTHROPIC_API_KEY":  "${BDAYA_ALIBABA_API_KEY}",
+	}
+	block := RenderAuthProfileBlock("alibaba2", "alibaba2@digrum.com", "Alibaba Qwen — alibaba2", "api_key", authEnv)
+
+	doc := "source_dir = \"~/.claude\"\n" + block
+	var cfg Config
+	if err := toml.Unmarshal([]byte(doc), &cfg); err != nil {
+		t.Fatalf("rendered block does not parse as TOML: %v\n---\n%s", err, doc)
+	}
+	p := cfg.Profiles["alibaba2"]
+	if p == nil {
+		t.Fatalf("profile alibaba2 missing after parse:\n%s", doc)
+	}
+	if p.Auth == nil || p.Auth.Mode != "api_key" {
+		t.Fatalf("auth = %+v, want mode=api_key", p.Auth)
+	}
+	if p.Auth.Env["ANTHROPIC_BASE_URL"] != "${BDAYA_ALIBABA_BASE_URL}" {
+		t.Errorf("auth.env = %v", p.Auth.Env)
+	}
+	// This path composes from [base] by construction -- no args/env/model
+	// should be baked into the profile stanza itself.
+	if len(p.Args) != 0 || p.Model != "" || len(p.Env) != 0 {
+		t.Errorf("expected no baked-in args/model/env, got Args=%v Model=%q Env=%v", p.Args, p.Model, p.Env)
+	}
+}
+
+func TestAddProfileWithAuthValidatesInputs(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	os.WriteFile(configPath, []byte("source_dir = \"~/.claude\"\n\n[profiles.existing]\ndescription = \"x\"\n"), 0o644)
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := AddProfileWithAuth(cfg, configPath, "x@example.com", "existing", "api_key",
+		map[string]string{"ANTHROPIC_API_KEY": "${X}"}, false); err == nil {
+		t.Error("expected an error for a duplicate alias")
+	}
+	if err := AddProfileWithAuth(cfg, configPath, "x@example.com", "newone", "not-a-mode",
+		map[string]string{"ANTHROPIC_API_KEY": "${X}"}, false); err == nil {
+		t.Error("expected an error for an invalid --auth-mode")
+	}
+	if err := AddProfileWithAuth(cfg, configPath, "x@example.com", "newone", "api_key",
+		nil, false); err == nil {
+		t.Error("expected an error when no auth env is provided")
+	}
+}
+
 func TestAppendProfileBlock(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
@@ -243,16 +297,19 @@ func TestProfileAuthStatusFalseWithoutClaudeOnPath(t *testing.T) {
 	}
 }
 
-func boolPtr(b bool) *bool { return &b }
-
+// TestManageMCPEnabled is superseded by config_test.go's
+// TestConfigManageMCPEnabledCompat (added alongside the manage_mcp mode-value
+// schema change — see resolveManageMCPMode) but kept here, updated to the new
+// `any`-typed field, so this file's own coverage of the add-path's
+// manage_mcp gate doesn't silently vanish.
 func TestManageMCPEnabled(t *testing.T) {
 	if !(&Config{}).ManageMCPEnabled() {
 		t.Error("nil manage_mcp should default to enabled")
 	}
-	if !(&Config{ManageMCP: boolPtr(true)}).ManageMCPEnabled() {
+	if !(&Config{ManageMCP: true}).ManageMCPEnabled() {
 		t.Error("manage_mcp=true should be enabled")
 	}
-	if (&Config{ManageMCP: boolPtr(false)}).ManageMCPEnabled() {
+	if (&Config{ManageMCP: false}).ManageMCPEnabled() {
 		t.Error("manage_mcp=false should be disabled")
 	}
 }
