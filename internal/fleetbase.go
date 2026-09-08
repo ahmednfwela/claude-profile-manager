@@ -5,28 +5,89 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
 
+// FleetBase is fleet/profiles/base.toml as cpm consumes it: the decoded
+// [base] table (what RenderProfile merges) AND the verbatim text of that
+// table (what `cpm sync` splices into config.toml between the CPM-MANAGED
+// sentinels). Both come from the same bytes, so the file fleet-doctor's F10
+// check grades a device against and the block cpm writes can never say two
+// different things.
+type FleetBase struct {
+	Base *Base
+	// Block is base.toml from its "[base]" header line to end of file: the
+	// `[base]` / `[base.env]` / `os_overlay = {...}` shape, comments after
+	// the header included, the leading documentation banner excluded, line
+	// endings normalised to "\n", trailing whitespace trimmed.
+	Block string
+}
+
 // LoadFleetBase reads fleet/profiles/base.toml from a fleet-repo checkout at
-// repoPath and decodes it into a Base -- the "single generator for [base]"
-// named by the design spec's work item (B). The file's own top-level shape
-// mirrors config.toml's [base] table WITHOUT the "base" wrapper key (its
-// entire content already IS the base declaration): plain `model`/`args` at
-// the top level, plus `[env]`/`[env.<goos>]` tables (not `[base.env]` --
-// there is no surrounding [base] table in this standalone file).
-func LoadFleetBase(repoPath string) (*Base, error) {
+// repoPath -- the "single generator for [base]" named by the design spec's
+// work item (B).
+//
+// The file's shape is the SAME as config.toml's [base] table, wrapper
+// included. This is what shared/claude-plugins ships, what onboard renders
+// a first-enrolled machine from, and what its fleet-doctor F10 check compares
+// a live config.toml against key for key:
+//
+//	[base]
+//	model = ""
+//	args = ["--dangerously-skip-permissions", "...", "~/.claude-profiles/lane-authority.md"]
+//	[base.env]
+//	KEY = "value"
+//	os_overlay = { windows = { KEY = "v" }, darwin = {} }
+//
+// The per-GOOS overlay is the `os_overlay` INLINE TABLE under [base.env]
+// (keyed by Go's runtime.GOOS names) rather than [base.env.<goos>] subtable
+// headers, because the fleet's own TOML reader cannot parse nested dotted
+// headers -- see that file's FORMAT NOTE 2. `~/...` values are placeholders
+// each machine resolves at render time (ResolveRendered), never here.
+//
+// A file without a "[base]" header line (e.g. a bare top-level model/args
+// file -- the shape cpm v0.6.0 wrongly expected, which decoded the real file
+// to an EMPTY table and rendered an empty [base] into config.toml without a
+// word) is an error, as is a [base] table with no model, args, or env: cpm
+// refuses to render nothing where the fleet clearly meant something.
+func LoadFleetBase(repoPath string) (*FleetBase, error) {
 	path := filepath.Join(ExpandPath(repoPath), "profiles", "base.toml")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read %s: %w", path, err)
 	}
-	var base Base
-	if err := toml.Unmarshal(data, &base); err != nil {
+	block, ok := extractBaseTable(string(data))
+	if !ok {
+		return nil, fmt.Errorf("%s has no [base] table header -- expected the fleet shape ([base] / [base.env] / os_overlay = {...}); a bare top-level model/args file is not accepted", path)
+	}
+	var file struct {
+		Base *Base `toml:"base"`
+	}
+	if err := toml.Unmarshal([]byte(block), &file); err != nil {
 		return nil, fmt.Errorf("cannot parse %s: %w", path, err)
 	}
-	return &base, nil
+	b := file.Base
+	if b == nil || (b.Model == "" && len(b.Args) == 0 && len(b.Env) == 0) {
+		return nil, fmt.Errorf("%s: [base] declares no model, args, or env -- refusing to render an empty [base] into config.toml", path)
+	}
+	return &FleetBase{Base: b, Block: block}, nil
+}
+
+// extractBaseTable returns content from the first line that is exactly
+// "[base]" (whitespace-trimmed; a commented-out or indented mention does not
+// count) through end of file, CRLF normalised to LF and trailing whitespace
+// removed. ok=false when no such line exists.
+func extractBaseTable(content string) (block string, ok bool) {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	lines := strings.Split(content, "\n")
+	for i, l := range lines {
+		if strings.TrimSpace(l) == "[base]" {
+			return strings.TrimRight(strings.Join(lines[i:], "\n"), " \t\n"), true
+		}
+	}
+	return "", false
 }
 
 // FleetDeviceID resolves "this machine's" identity for fleet-repo staging

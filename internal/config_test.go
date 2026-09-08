@@ -217,9 +217,7 @@ model = "sonnet"
 args = ["--dangerously-skip-permissions"]
 [base.env]
 ENABLE_TOOL_SEARCH = "true"
-[base.env.windows]
-CLAUDE_CODE_USE_POWERSHELL_TOOL = "1"
-[base.env.darwin]
+os_overlay = { windows = { CLAUDE_CODE_USE_POWERSHELL_TOOL = "1" }, darwin = {} }
 
 [profiles.bdaya]
 description = "Claude Max — bdaya"
@@ -267,8 +265,11 @@ CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
 	if common["ENABLE_TOOL_SEARCH"] != "true" {
 		t.Errorf("base.env common = %v", common)
 	}
-	if _, isOverlay := common["windows"]; isOverlay {
-		t.Error("BaseEnvCommon must not leak the windows overlay subtable as a flat key")
+	if _, isOverlay := common["os_overlay"]; isOverlay {
+		t.Error("BaseEnvCommon must not leak the os_overlay table as a flat key")
+	}
+	if got := cfg.Base.BaseEnvOverlay("darwin"); len(got) != 0 {
+		t.Errorf("base.env os_overlay.darwin (declared empty) should be empty, got %v", got)
 	}
 	winOverlay := cfg.Base.BaseEnvOverlay("windows")
 	if winOverlay["CLAUDE_CODE_USE_POWERSHELL_TOOL"] != "1" {

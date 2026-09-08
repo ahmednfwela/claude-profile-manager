@@ -2,7 +2,6 @@ package internal
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 )
 
@@ -18,62 +17,18 @@ const (
 	baseSentinelEndLine   = "# --- END CPM-MANAGED [base] ---"
 )
 
-// RenderBaseBlock renders b as the literal, sentinel-delimited [base] TOML
-// text cpm sync splices into config.toml. Deterministic (sorted keys) so
-// repeated renders of an unchanged Base are byte-identical -- required for
-// `cpm sync --dry-run`'s diff and `cpm doctor`'s local-modification flag to
-// be stable rather than flapping on map-iteration order.
-func RenderBaseBlock(b *Base) string {
-	var buf strings.Builder
-	buf.WriteString(baseSentinelBeginLine + "\n")
-	buf.WriteString("[base]\n")
-	if b != nil && b.Model != "" {
-		fmt.Fprintf(&buf, "model = %s\n", tomlValue(b.Model))
-	}
-	if b != nil && len(b.Args) > 0 {
-		parts := make([]string, len(b.Args))
-		for i, a := range b.Args {
-			parts[i] = tomlValue(a)
-		}
-		fmt.Fprintf(&buf, "args = [%s]\n", strings.Join(parts, ", "))
-	}
-	if b != nil {
-		common := b.BaseEnvCommon()
-		if len(common) > 0 {
-			buf.WriteString("[base.env]\n")
-			for _, k := range sortedEnvKeys(common) {
-				fmt.Fprintf(&buf, "%s = %s\n", k, tomlValue(common[k]))
-			}
-		}
-		for _, goos := range sortedOverlayGOOS(b) {
-			overlay := b.BaseEnvOverlay(goos)
-			if len(overlay) == 0 {
-				continue // an empty overlay table proves the merge point exists but renders nothing
-			}
-			fmt.Fprintf(&buf, "[base.env.%s]\n", goos)
-			for _, k := range sortedEnvKeys(overlay) {
-				fmt.Fprintf(&buf, "%s = %s\n", k, tomlValue(overlay[k]))
-			}
-		}
-	}
-	buf.WriteString(baseSentinelEndLine + "\n")
-	return buf.String()
-}
-
-// sortedOverlayGOOS returns the map-valued (i.e. per-GOOS overlay subtable)
-// keys of b.Env, sorted, so RenderBaseBlock's section order is deterministic.
-func sortedOverlayGOOS(b *Base) []string {
-	if b == nil {
-		return nil
-	}
-	var out []string
-	for k, v := range b.Env {
-		if _, ok := v.(map[string]any); ok {
-			out = append(out, k)
-		}
-	}
-	sort.Strings(out)
-	return out
+// RenderBaseBlock wraps block -- fleet/profiles/base.toml's [base] table
+// text, verbatim (FleetBase.Block) -- in the sentinel pair `cpm sync` splices
+// into config.toml. Verbatim on purpose: the fleet's own fleet-doctor F10
+// check compares a device's config.toml [base] against base.toml key for key
+// (`~/...` placeholders and the os_overlay inline table included), so cpm
+// must not re-serialise, re-order, resolve, or "improve" anything here.
+// Placeholders are resolved per machine at render time (ResolveRendered),
+// never in this table. Deterministic by construction: same input bytes,
+// same output bytes -- required for `cpm sync --dry-run`'s diff and
+// `cpm doctor`'s local-modification flag to be stable rather than flapping.
+func RenderBaseBlock(block string) string {
+	return baseSentinelBeginLine + "\n" + strings.TrimRight(block, " \t\r\n") + "\n" + baseSentinelEndLine + "\n"
 }
 
 // ExtractBase returns the exact byte range spanning the sentinel pair

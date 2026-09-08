@@ -39,6 +39,13 @@ type ProfileSyncResult struct {
 type SyncReport struct {
 	BaseDiff *FileDiff
 	Profiles []ProfileSyncResult
+	// Warnings name the parts of the job RunSync could NOT do -- no [fleet]
+	// repo_path, or a repo_path whose checkout has no profiles/base.toml --
+	// so "everything already in sync" is never printed over a sync that
+	// silently skipped its main input (the exact failure a fresh machine hit
+	// on v0.6.0). Not drift: HasDrift ignores them; PrintSyncReport shows
+	// them every time.
+	Warnings []string
 }
 
 // HasDrift reports whether ANY diff -- [base] or any profile's -- is
@@ -66,9 +73,11 @@ func (r SyncReport) HasDrift() bool {
 // deliberately the ONLY place that computes "did anything change", so the two
 // commands can never disagree.
 //
-// A profile whose [fleet].repo_path is unset, or whose fleet-repo checkout
-// has no profiles/base.toml yet, produces no [base] diff at all (rather than
-// erroring) -- config.toml predating this feature is a valid, quiet state.
+// A config whose [fleet].repo_path is unset, or whose fleet-repo checkout
+// has no profiles/base.toml yet, produces no [base] diff (config.toml
+// predating this feature is a valid state) -- but never a QUIET one: each
+// case lands in SyncReport.Warnings so the operator learns the sync had no
+// input, instead of reading "everything already in sync".
 func RunSync(cfg *Config, configPath string, opts SyncOptions) (SyncReport, error) {
 	goos := opts.GOOS
 	if goos == "" {
@@ -81,13 +90,21 @@ func RunSync(cfg *Config, configPath string, opts SyncOptions) (SyncReport, erro
 
 	var report SyncReport
 
-	if cfg.Fleet != nil && cfg.Fleet.RepoPath != "" {
-		if _, statErr := os.Stat(filepath.Join(ExpandPath(cfg.Fleet.RepoPath), "profiles", "base.toml")); statErr == nil {
+	switch {
+	case cfg.Fleet == nil || cfg.Fleet.RepoPath == "":
+		report.Warnings = append(report.Warnings,
+			"[fleet] repo_path is not set in config.toml -- config.toml [base] and per-profile mcpServers were NOT synced (set repo_path to this machine's shared/claude-plugins fleet/ checkout)")
+	default:
+		basePath := filepath.Join(ExpandPath(cfg.Fleet.RepoPath), "profiles", "base.toml")
+		if _, statErr := os.Stat(basePath); statErr != nil {
+			report.Warnings = append(report.Warnings,
+				fmt.Sprintf("%s not found -- config.toml [base] was NOT synced (fleet checkout predates work item B, or [fleet] repo_path points elsewhere)", basePath))
+		} else {
 			fleetBase, err := LoadFleetBase(cfg.Fleet.RepoPath)
 			if err != nil {
 				return report, fmt.Errorf("load fleet/profiles/base.toml: %w", err)
 			}
-			rendered := RenderBaseBlock(fleetBase)
+			rendered := RenderBaseBlock(fleetBase.Block)
 			newTrimmed := strings.TrimRight(rendered, "\n")
 
 			rawConfig, err := os.ReadFile(ExpandPath(configPath))
@@ -187,6 +204,9 @@ func PrintSyncReport(report SyncReport, applied bool) {
 	verb := "would change"
 	if applied {
 		verb = "applied"
+	}
+	for _, w := range report.Warnings {
+		fmt.Fprintln(os.Stderr, "cpm sync: warning: "+w)
 	}
 	if !report.HasDrift() {
 		fmt.Println("cpm sync: everything already in sync.")

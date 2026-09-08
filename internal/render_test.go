@@ -21,8 +21,10 @@ func TestRenderProfileBaseAndDeltaMerge(t *testing.T) {
 			Args:  []string{"--dangerously-skip-permissions"},
 			Env: map[string]any{
 				"ENABLE_TOOL_SEARCH": "true",
-				"windows": map[string]any{
-					"CLAUDE_CODE_USE_POWERSHELL_TOOL": "1",
+				"os_overlay": map[string]any{
+					"windows": map[string]any{
+						"CLAUDE_CODE_USE_POWERSHELL_TOOL": "1",
+					},
 				},
 			},
 		},
@@ -76,11 +78,13 @@ func TestRenderProfilePerOSOverlay(t *testing.T) {
 		Base: &Base{
 			Env: map[string]any{
 				"COMMON_KEY": "common",
-				"windows": map[string]any{
-					"CLAUDE_CODE_USE_POWERSHELL_TOOL": "1",
-				},
-				"darwin": map[string]any{
-					"SOME_MAC_ONLY_KEY": "mac",
+				"os_overlay": map[string]any{
+					"windows": map[string]any{
+						"CLAUDE_CODE_USE_POWERSHELL_TOOL": "1",
+					},
+					"darwin": map[string]any{
+						"SOME_MAC_ONLY_KEY": "mac",
+					},
 				},
 			},
 		},
@@ -174,6 +178,69 @@ func TestRenderProfileAuthKeyCollisionIsAnError(t *testing.T) {
 	_, err := RenderProfile(cfg, "bad", "linux")
 	if err == nil {
 		t.Fatal("expected an auth-key collision error, got nil")
+	}
+}
+
+// ResolveRendered applies base.toml's placeholder contract per machine:
+// "~/" -> home (forward-slashed), and the --append-system-prompt-file pair is
+// dropped as a unit when its resolved file does not exist. The input is never
+// mutated and the [base]-side placeholders are never touched here (see
+// TestRenderBaseBlockIsVerbatim for that half of the contract).
+func TestResolveRenderedPlaceholders(t *testing.T) {
+	in := RenderedProfile{
+		Args: []string{
+			"--dangerously-skip-permissions",
+			"--append-system-prompt-file", "~/.claude-profiles/lane-authority.md",
+			"--model", "sonnet",
+		},
+		Env: map[string]string{
+			"CLAUDE_CODE_PLUGIN_CACHE_DIR": "~/.claude/plugins",
+			"PLAIN":                        "~not-a-placeholder",
+		},
+		Model: "sonnet",
+	}
+	home := `C:\Users\ahmed`
+
+	present := ResolveRendered(in, RenderOptions{Home: home, FileExists: func(string) bool { return true }})
+	wantArgs := []string{"--dangerously-skip-permissions", "--append-system-prompt-file", "C:/Users/ahmed/.claude-profiles/lane-authority.md", "--model", "sonnet"}
+	if !reflect.DeepEqual(present.Args, wantArgs) {
+		t.Errorf("Args = %v, want %v", present.Args, wantArgs)
+	}
+	if present.Env["CLAUDE_CODE_PLUGIN_CACHE_DIR"] != "C:/Users/ahmed/.claude/plugins" || present.Env["PLAIN"] != "~not-a-placeholder" {
+		t.Errorf("Env = %v", present.Env)
+	}
+	if present.Model != "sonnet" {
+		t.Errorf("Model = %q, want sonnet", present.Model)
+	}
+
+	var asked []string
+	absent := ResolveRendered(in, RenderOptions{Home: home, FileExists: func(p string) bool { asked = append(asked, p); return false }})
+	wantArgs = []string{"--dangerously-skip-permissions", "--model", "sonnet"}
+	if !reflect.DeepEqual(absent.Args, wantArgs) {
+		t.Errorf("Args with a missing grant file = %v, want %v (flag AND operand dropped together)", absent.Args, wantArgs)
+	}
+	if !reflect.DeepEqual(asked, []string{"C:/Users/ahmed/.claude-profiles/lane-authority.md"}) {
+		t.Errorf("FileExists must be asked about the RESOLVED path only, got %v", asked)
+	}
+
+	eqDropped := ResolveRendered(RenderedProfile{Args: []string{"--append-system-prompt-file=~/g.md", "x"}},
+		RenderOptions{Home: "/home/u", FileExists: func(string) bool { return false }})
+	if !reflect.DeepEqual(eqDropped.Args, []string{"x"}) {
+		t.Errorf("'=' form must be dropped as one token, got %v", eqDropped.Args)
+	}
+	eqKept := ResolveRendered(RenderedProfile{Args: []string{"--append-system-prompt-file=~/g.md"}}, RenderOptions{Home: "/home/u"})
+	if !reflect.DeepEqual(eqKept.Args, []string{"--append-system-prompt-file=/home/u/g.md"}) {
+		t.Errorf("'=' form must resolve in place, got %v", eqKept.Args)
+	}
+
+	// No home known: placeholders are left alone rather than rooted at "/".
+	noHome := ResolveRendered(RenderedProfile{Args: []string{"~/x"}}, RenderOptions{})
+	if !reflect.DeepEqual(noHome.Args, []string{"~/x"}) {
+		t.Errorf("empty Home must leave placeholders untouched, got %v", noHome.Args)
+	}
+	// The input must not be mutated.
+	if in.Args[2] != "~/.claude-profiles/lane-authority.md" || in.Env["CLAUDE_CODE_PLUGIN_CACHE_DIR"] != "~/.claude/plugins" {
+		t.Error("ResolveRendered mutated its input")
 	}
 }
 
