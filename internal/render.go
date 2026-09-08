@@ -2,7 +2,6 @@ package internal
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 )
 
@@ -162,9 +161,16 @@ func ResolveRendered(rp RenderedProfile, opts RenderOptions) RenderedProfile {
 // expandHomePlaceholder replaces a leading "~/" with home (forward-slashed,
 // no trailing slash); any other value is returned unchanged. An empty home
 // leaves the placeholder alone rather than producing a path rooted at "/".
+//
+// Backslashes are converted explicitly rather than via filepath.ToSlash: that
+// helper only rewrites the HOST OS separator, so a Windows home rendered on
+// Linux/macOS (a fleet-side renderer, a cross-platform test) would keep its
+// backslashes and never match the "C:/Users/<u>/..." form the fleet expects.
+// The output is the same on every GOOS for the same input, which is what
+// makes ResolveRendered a pure function rather than a per-platform one.
 func expandHomePlaceholder(v, home string) string {
 	if home == "" || !strings.HasPrefix(v, "~/") {
 		return v
 	}
-	return strings.TrimRight(filepath.ToSlash(home), "/") + v[1:]
+	return strings.TrimRight(strings.ReplaceAll(home, `\`, "/"), "/") + v[1:]
 }
